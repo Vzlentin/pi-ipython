@@ -1,0 +1,10 @@
+- Read both `extensions/rlm.ts` and `extensions/ipykernel.py` before changing runtime behavior. They are the host and kernel halves of the same bridge.
+- Keep host-socket protocol versions, request and response shapes, authentication, size limits, and timeout assumptions synchronized across the TypeScript and Python halves. Extend `tests/test_static.py` for shared invariants that can be checked without a model.
+- Keep `extensions/ipykernel.py` from shadowing the installed `ipykernel` package. Its early `sys.path` cleanup and the extension-owned kernelspec override are deliberate.
+- Preserve the extension-owned Python 3.12 runtime. Do not edit or commit `extensions/.rlm-python/`, `extensions/.rlm-python.lock`, `__pycache__`, or other provisioned artifacts.
+- Keep RLM children fresh, tool-free, depth-1 sessions with no inherited skills, prompt templates, themes, context files, or transcript. They may inherit only the active model runtime, thinking level, working directory, explicit task, and explicit context.
+- Treat cancellation, process-group reaping, socket cleanup, and kernel-reset reporting as one lifecycle. Changes in this area need acceptance coverage for cleanup and recovery, not only a successful execution check.
+- Do not eagerly discard live child handles after a successful cell. Cross-cell handles and a background gather racing a later gather are intentional supported cases.
+- Preserve atomic gather ownership and single usage attribution. A handle may produce one committed gather result even when gathers race.
+- Run `npm test` for every code change. It is the model-free typecheck and static-test gate.
+- Run `PI_RLM_TEST_MODEL=<provider/model> npm run test:integration` when changing the bridge protocol, child sessions, persistence, cancellation, or cleanup. Run `test:integration:full` only when the large-context path is relevant because it incurs substantial model input.
