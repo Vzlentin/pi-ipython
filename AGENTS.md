@@ -1,6 +1,6 @@
-- Read both `extensions/rlm.ts` and `extensions/ipykernel.py` before changing runtime behavior. They are the host and kernel halves of the same bridge.
+- Read both `extensions/rlm.ts` and `extensions/ipkl.py` before changing runtime behavior. They are the host and kernel halves of the same bridge.
 - Keep host-socket protocol versions, request and response shapes, authentication, size limits, and timeout assumptions synchronized across the TypeScript and Python halves. Extend `tests/test_static.py` for shared invariants that can be checked without a model.
-- Keep `extensions/ipykernel.py` from shadowing the installed `ipykernel` package. Its early `sys.path` cleanup and the extension-owned kernelspec override are deliberate.
+- Keep `extensions/ipkl.py` from shadowing installed Python packages. Its early `sys.path` cleanup and the extension-owned kernelspec override are deliberate.
 - Preserve the extension-owned Python 3.12 runtime. Do not edit or commit `extensions/.rlm-python/`, `extensions/.rlm-python.lock`, `__pycache__`, or other provisioned artifacts.
 - Keep RLM children fresh, tool-free, depth-1 sessions with no inherited skills, prompt templates, themes, context files, or transcript. They may inherit only the active model runtime, thinking level, working directory, explicit task, and explicit context.
 - Treat cancellation, process-group reaping, socket cleanup, and kernel-reset reporting as one lifecycle. Changes in this area need acceptance coverage for cleanup and recovery, not only a successful execution check.

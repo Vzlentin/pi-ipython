@@ -16,8 +16,8 @@ import sys
 import traceback
 from typing import Any, Iterable
 
-# This file is intentionally named ipykernel.py. Keep its directory off sys.path so
-# it cannot shadow the installed ipykernel package used by jupyter_client.
+# Keep the bridge directory off sys.path so local extension modules cannot shadow
+# packages from the extension-owned Python runtime.
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path = [
     path

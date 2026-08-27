@@ -12,7 +12,7 @@ from typing import Any, Callable
 
 ROOT = Path(__file__).resolve().parents[2]
 EXTENSION = ROOT / "extensions" / "rlm.ts"
-BRIDGE = ROOT / "extensions" / "ipykernel.py"
+BRIDGE = ROOT / "extensions" / "ipkl.py"
 MODEL = os.environ.get("PI_RLM_TEST_MODEL")
 THINKING = os.environ.get("PI_RLM_TEST_THINKING", "low")
 TIMEOUT = int(os.environ.get("PI_RLM_TEST_TIMEOUT", "300"))

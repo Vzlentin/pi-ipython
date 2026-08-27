@@ -8,7 +8,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 TS_PATH = ROOT / "extensions" / "rlm.ts"
-PY_PATH = ROOT / "extensions" / "ipykernel.py"
+PY_PATH = ROOT / "extensions" / "ipkl.py"
 
 
 class StaticPackageTests(unittest.TestCase):
