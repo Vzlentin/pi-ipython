@@ -1,0 +1,7 @@
+node_modules/
+extensions/.rlm-python/
+extensions/.rlm-python.lock
+**/__pycache__/
+*.py[cod]
+.coverage
+.DS_Store

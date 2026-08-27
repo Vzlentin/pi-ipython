@@ -1,0 +1,36 @@
+{
+  "name": "pi-ipykernel-rlm",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Persistent IPython and focused recursive language-model calls for Pi",
+  "keywords": [
+    "pi-package",
+    "ipython",
+    "rlm"
+  ],
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json",
+    "test:static": "python3 -m unittest tests.test_static",
+    "test": "npm run typecheck && npm run test:static",
+    "test:integration": "python3 -m unittest tests.integration.test_acceptance",
+    "test:integration:full": "PI_RLM_TEST_INCLUDE_LARGE=1 python3 -m unittest tests.integration.test_acceptance"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions/rlm.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "0.84.3",
+    "@earendil-works/pi-coding-agent": "0.84.3",
+    "@types/node": "22.19.7",
+    "typebox": "1.3.7",
+    "typescript": "5.9.3"
+  }
+}
