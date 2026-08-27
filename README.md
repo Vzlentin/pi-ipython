@@ -1,4 +1,4 @@
-# pi-ipykernel-rlm
+# pi-ipython-rlm
 
 A local Pi package providing one `ipython` tool with:
 

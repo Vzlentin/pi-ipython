@@ -14,7 +14,7 @@ PY_PATH = ROOT / "extensions" / "ipkl.py"
 class StaticPackageTests(unittest.TestCase):
     def test_manifest_loads_exactly_one_extension(self) -> None:
         package = json.loads((ROOT / "package.json").read_text())
-        self.assertEqual(package["name"], "pi-ipykernel-rlm")
+        self.assertEqual(package["name"], "pi-ipython-rlm")
         self.assertEqual(package["pi"]["extensions"], ["./extensions/rlm.ts"])
 
     def test_extension_registers_only_ipython(self) -> None:
