@@ -25,7 +25,7 @@ import {
 import { Type } from "typebox";
 
 const EXTENSION_DIR = dirname(fileURLToPath(import.meta.url));
-const BRIDGE_PATH = join(EXTENSION_DIR, "ipkl.py");
+const BRIDGE_PATH = join(EXTENSION_DIR, "ipython.py");
 const RUNTIME_DIR = join(EXTENSION_DIR, ".rlm-python");
 const PYTHON_PATH = join(RUNTIME_DIR, "bin", "python");
 const PROVISION_LOCK = join(EXTENSION_DIR, ".rlm-python.lock");
