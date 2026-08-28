@@ -1348,16 +1348,23 @@ export default function rlmExtension(pi: ExtensionAPI) {
 		executionMode: "sequential",
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
 			let latestOutput = "";
+			let lastUpdate = 0;
+			let updateTimer: ReturnType<typeof setTimeout> | undefined;
+			const progressWidgetId = "pi-ipython-rlm-progress";
 			const progress = (message: string) => {
+				if (updateTimer) {
+					clearTimeout(updateTimer);
+					updateTimer = undefined;
+				}
+				lastUpdate = Date.now();
 				const status = message.startsWith("Starting") || message.startsWith("Provisioning") ? "starting" : "running";
-				const text = latestOutput ? `${partialText(latestOutput)}\n\n${message}` : message;
+				const text = latestOutput ? `${message}\n\n${partialText(latestOutput)}` : message;
+				if (ctx.mode === "tui") ctx.ui.setWidget(progressWidgetId, [`RLM: ${message}`]);
 				onUpdate?.({
 					content: [{ type: "text", text }],
 					details: { status } satisfies IpythonDetails,
 				});
 			};
-			let lastUpdate = 0;
-			let updateTimer: ReturnType<typeof setTimeout> | undefined;
 			const emitOutput = () => {
 				updateTimer = undefined;
 				lastUpdate = Date.now();
@@ -1395,6 +1402,7 @@ export default function rlmExtension(pi: ExtensionAPI) {
 				);
 			} finally {
 				if (updateTimer) clearTimeout(updateTimer);
+				if (ctx.mode === "tui") ctx.ui.setWidget(progressWidgetId, undefined);
 			}
 			const { result, kernelReset, host } = execution;
 			const formatted = await finalText(result.output);

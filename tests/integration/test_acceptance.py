@@ -211,7 +211,10 @@ class Slice2AcceptanceTests(unittest.TestCase):
         self.assertEqual(bridge_processes(), [])
 
     def test_parallel_progress_final_and_usage(self) -> None:
-        prompt = '''Call ipython exactly once with this exact code and do nothing else: hs=[await rlm.spawn("Reply with exactly ALPHA."),await rlm.spawn("Reply with exactly BETA.")]
+        prompt = '''Call ipython exactly once with this exact code and do nothing else: import asyncio
+print("\\n".join(f"line-{i}" for i in range(12)))
+await asyncio.sleep(0.2)
+hs=[await rlm.spawn("Reply with exactly ALPHA."),await rlm.spawn("Reply with exactly BETA.")]
 rs=await rlm.gather(hs)
 await rlm.final({"statuses":[r["status"] for r in rs],"texts":[r["text"] for r in rs]})'''
         events = run_print(prompt)
@@ -231,9 +234,11 @@ await rlm.final({"statuses":[r["status"] for r in rs],"texts":[r["text"] for r i
             if event.get("type") == "tool_execution_update"
             and "RLM child" in event["partialResult"]["content"][0]["text"]
         ]
-        self.assertIn("Waiting for 2 RLM children…", progress)
-        self.assertIn("RLM children completed: 2/2", progress)
-        self.assertTrue(result["content"][0]["text"].startswith("[RLM final — terminating]"))
+        waiting = next(text for text in progress if "Waiting for 2 RLM children…" in text)
+        self.assertTrue(waiting.startswith("Waiting for 2 RLM children…"))
+        self.assertIn("line-11", waiting)
+        self.assertTrue(any(text.startswith("RLM children completed: 2/2") for text in progress))
+        self.assertIn("[RLM final — terminating]", result["content"][0]["text"])
 
     def test_atomic_concurrent_gather(self) -> None:
         prompt = '''Call ipython exactly once with this exact code and do nothing else: import asyncio
