@@ -48,3 +48,14 @@ Optional environment variables:
 - `PI_RLM_TEST_THINKING` — defaults to `low`.
 - `PI_RLM_TEST_TIMEOUT` — per-run seconds, defaults to `300`.
 - `PI_RLM_TEST_AGENT_DIR` — Pi agent directory used for credentials and provider settings.
+
+## Paper benchmarks
+
+Run the public OOLONG and LongBench-v2 CodeQA profiles from the Recursive Language Models paper:
+
+```bash
+npm run eval:oolong -- --model openai-codex/gpt-5.6-sol
+npm run eval:longbench -- --model openai-codex/gpt-5.6-sol
+```
+
+OOLONG defaults to all 400 held-out test cases at 131K tokens. LongBench defaults to all 50 CodeQA cases. Both evals are opt-in and can consume substantial time and tokens. See [`benchmarks/README.md`](benchmarks/README.md) for the paper's 50-case `trec_coarse` profile, smaller runs, and result fields.

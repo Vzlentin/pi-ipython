@@ -16,16 +16,7 @@ import sys
 import traceback
 from typing import Any, Iterable
 
-# Keep the bridge directory off sys.path so local extension modules cannot shadow
-# packages from the extension-owned Python runtime.
-_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-sys.path = [
-    path
-    for path in sys.path
-    if os.path.abspath(path or os.getcwd()) != _SCRIPT_DIR
-]
-
-from jupyter_client import KernelManager  # noqa: E402
+from jupyter_client import KernelManager
 
 _OUTPUT_MESSAGE_CHARS = 16_384
 _HOST_PROTOCOL_VERSION = 1

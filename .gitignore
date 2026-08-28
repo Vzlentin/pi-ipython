@@ -1,4 +1,5 @@
 node_modules/
+benchmark-results/
 extensions/.rlm-python/
 extensions/.rlm-python.lock
 **/__pycache__/
