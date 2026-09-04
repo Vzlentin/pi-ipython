@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import json
 import os
-from pathlib import Path
 import select
+import socket
 import subprocess
 import tempfile
+import threading
 import time
 import unittest
-from typing import Any, Callable
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any
 
 ROOT = Path(__file__).resolve().parents[2]
 EXTENSION = ROOT / "extensions" / "rlm.ts"
@@ -86,10 +89,191 @@ def host_directories() -> set[Path]:
 
 
 def bridge_processes() -> list[str]:
-    result = subprocess.run(
-        ["ps", "-eo", "cmd="], stdout=subprocess.PIPE, text=True, check=True
-    )
+    result = subprocess.run(["ps", "-eo", "cmd="], stdout=subprocess.PIPE, text=True, check=True)
     return [line for line in result.stdout.splitlines() if str(BRIDGE) in line]
+
+
+def bridge_command() -> list[str]:
+    provisioned = ROOT / "extensions" / ".rlm-python" / "bin" / "python"
+    if provisioned.is_file():
+        return [str(provisioned), "-I", str(BRIDGE)]
+    return [
+        "uv",
+        "run",
+        "--no-project",
+        "--python",
+        "3.12",
+        "--with",
+        "ipykernel>=7,<8",
+        "--with",
+        "jupyter-client>=8,<9",
+        "python",
+        "-I",
+        str(BRIDGE),
+    ]
+
+
+def read_bridge_event(process: subprocess.Popen[bytes], deadline: float) -> dict[str, Any]:
+    assert process.stdout is not None
+    while time.monotonic() < deadline:
+        ready, _, _ = select.select([process.stdout], [], [], min(0.2, deadline - time.monotonic()))
+        if not ready:
+            continue
+        raw = process.stdout.readline()
+        if raw:
+            return json.loads(raw)
+        break
+    stderr = b""
+    if process.poll() is not None and process.stderr is not None:
+        stderr = process.stderr.read()
+    raise AssertionError(
+        f"Timed out waiting for bridge event; exit={process.poll()} "
+        f"stderr={stderr.decode(errors='replace')}"
+    )
+
+
+def execute_bridge(
+    process: subprocess.Popen[bytes], request_id: str, code: str, cwd: Path
+) -> list[dict[str, Any]]:
+    assert process.stdin is not None
+    process.stdin.write(
+        json.dumps(
+            {"type": "execute", "request_id": request_id, "code": code, "cwd": str(cwd)}
+        ).encode()
+        + b"\n"
+    )
+    process.stdin.flush()
+    deadline = time.monotonic() + 30
+    events: list[dict[str, Any]] = []
+    while True:
+        event = read_bridge_event(process, deadline)
+        events.append(event)
+        if event.get("request_id") == request_id and event.get("type") in {
+            "result",
+            "bridge_error",
+        }:
+            return events
+
+
+class BridgeWorkingDirectoryAcceptanceTests(unittest.TestCase):
+    def test_persistent_kernel_applies_each_cwd_to_cells_and_children(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pi-rlm-bridge-cwd-") as directory:
+            root = Path(directory)
+            first_cwd = root / "first"
+            second_cwd = root / "second"
+            first_cwd.mkdir()
+            second_cwd.mkdir()
+            socket_path = root / "host.sock"
+            auth_token = "acceptance-token"
+            child_requests: list[dict[str, Any]] = []
+            server_errors: list[BaseException] = []
+
+            server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            server.bind(str(socket_path))
+            server.listen()
+
+            def serve_child() -> None:
+                try:
+                    connection, _ = server.accept()
+                    with connection:
+                        payload = bytearray()
+                        while b"\n" not in payload:
+                            chunk = connection.recv(64 * 1024)
+                            if not chunk:
+                                raise ConnectionError("bridge closed the child request")
+                            payload.extend(chunk)
+                        request = json.loads(bytes(payload).split(b"\n", 1)[0])
+                        child_requests.append(request)
+                        result = {
+                            "status": "ok",
+                            "text": "child-ok",
+                            "error": None,
+                            "usage": {},
+                            "elapsed_ms": 1,
+                            "truncated": False,
+                        }
+                        connection.sendall(
+                            json.dumps(
+                                {
+                                    "version": 2,
+                                    "id": request["id"],
+                                    "ok": True,
+                                    "result": result,
+                                }
+                            ).encode()
+                            + b"\n"
+                        )
+                except BaseException as error:
+                    server_errors.append(error)
+
+            server_thread = threading.Thread(target=serve_child, daemon=True)
+            server_thread.start()
+            env = dict(
+                os.environ,
+                RLM_HOST_SOCKET=str(socket_path),
+                RLM_HOST_TOKEN=auth_token,
+                RLM_KERNEL_CWD=str(first_cwd),
+            )
+            process = subprocess.Popen(
+                bridge_command(),
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=env,
+                bufsize=0,
+            )
+            try:
+                deadline = time.monotonic() + 60
+                while read_bridge_event(process, deadline).get("type") != "ready":
+                    pass
+                first = execute_bridge(
+                    process,
+                    "cwd-one",
+                    "from pathlib import Path; print(Path.cwd())",
+                    first_cwd,
+                )
+                second = execute_bridge(
+                    process,
+                    "cwd-two",
+                    "from pathlib import Path; print(Path.cwd()); "
+                    "h=await rlm.spawn('cwd child'); "
+                    "print((await rlm.gather([h]))[0]['text'])",
+                    second_cwd,
+                )
+            finally:
+                if process.stdin is not None and not process.stdin.closed:
+                    if process.poll() is None:
+                        process.stdin.write(b'{"type":"shutdown"}\n')
+                        process.stdin.flush()
+                    process.stdin.close()
+                try:
+                    exit_code = process.wait(timeout=20)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    exit_code = process.wait()
+                stderr = process.stderr.read() if process.stderr is not None else b""
+                if process.stdout is not None:
+                    process.stdout.close()
+                if process.stderr is not None:
+                    process.stderr.close()
+                server.close()
+                server_thread.join(timeout=2)
+
+            self.assertEqual(exit_code, 0, stderr.decode(errors="replace"))
+            self.assertEqual(server_errors, [])
+            self.assertFalse(server_thread.is_alive())
+            self.assertEqual(len(child_requests), 1)
+            self.assertEqual(child_requests[0]["auth"], auth_token)
+            self.assertEqual(child_requests[0]["cwd"], str(second_cwd))
+
+            first_output = "".join(
+                event.get("text", "") for event in first if event.get("type") == "output"
+            )
+            second_output = "".join(
+                event.get("text", "") for event in second if event.get("type") == "output"
+            )
+            self.assertEqual(first_output.strip(), str(first_cwd))
+            self.assertEqual(second_output.splitlines(), [str(second_cwd), "child-ok"])
 
 
 class RpcPi:
@@ -211,12 +395,12 @@ class Slice2AcceptanceTests(unittest.TestCase):
         self.assertEqual(bridge_processes(), [])
 
     def test_parallel_progress_final_and_usage(self) -> None:
-        prompt = '''Call ipython exactly once with this exact code and do nothing else: import asyncio
+        prompt = """Call ipython exactly once with this exact code and do nothing else: import asyncio
 print("\\n".join(f"line-{i}" for i in range(12)))
 await asyncio.sleep(0.2)
 hs=[await rlm.spawn("Reply with exactly ALPHA."),await rlm.spawn("Reply with exactly BETA.")]
 rs=await rlm.gather(hs)
-await rlm.final({"statuses":[r["status"] for r in rs],"texts":[r["text"] for r in rs]})'''
+await rlm.final({"statuses":[r["status"] for r in rs],"texts":[r["text"] for r in rs]})"""
         events = run_print(prompt)
         end = tool_end(events)
         result = end["result"]
@@ -241,41 +425,68 @@ await rlm.final({"statuses":[r["status"] for r in rs],"texts":[r["text"] for r i
         self.assertIn("[RLM final — terminating]", result["content"][0]["text"])
 
     def test_atomic_concurrent_gather(self) -> None:
-        prompt = '''Call ipython exactly once with this exact code and do nothing else: import asyncio
+        prompt = """Call ipython exactly once with this exact code and do nothing else: import asyncio
 h=await rlm.spawn("Reply with exactly ALPHA.")
 async def one_gather():
     try:
         value=await rlm.gather([h])
-        return {"kind":"ok","text":value[0]["text"]}
+        return {"kind":"ok","text":value[0]["text"],"usage":value[0]["usage"]}
     except Exception as e:
         return {"kind":"error","type":type(e).__name__}
 a,b=await asyncio.gather(one_gather(),one_gather())
-await rlm.final({"attempts":[a,b]})'''
+await rlm.final({"attempts":[a,b]})"""
         result = tool_end(run_print(prompt))["result"]
         attempts = result["details"]["final"]["attempts"]
         self.assertEqual(sorted(item["kind"] for item in attempts), ["error", "ok"])
+        successful = next(item for item in attempts if item["kind"] == "ok")
+        self.assertEqual(result["details"]["nestedUsage"], successful["usage"])
         self.assertEqual(result["details"]["children"], {"spawned": 1, "gathered": 1})
 
     def test_failed_admission_preserves_sibling(self) -> None:
-        prompt = '''Call ipython exactly once with this exact code and do nothing else: good=await rlm.spawn("Reply with exactly SURVIVED.")
+        prompt = """Call ipython exactly once with this exact code and do nothing else: good=await rlm.spawn("Reply with exactly SURVIVED.")
 try:
     await rlm.spawn("oversized", context="x"*(1024*1024))
 except Exception as e:
     failed={"type":type(e).__name__,"message":str(e)}
 result=(await rlm.gather([good]))[0]
-await rlm.final({"failed":failed,"sibling":{"status":result["status"],"text":result["text"]}})'''
+await rlm.final({"failed":failed,"sibling":{"status":result["status"],"text":result["text"]}})"""
         final = tool_end(run_print(prompt))["result"]["details"]["final"]
         self.assertEqual(final["failed"]["type"], "RLMHostError")
         self.assertEqual(final["sibling"]["status"], "ok")
         self.assertEqual(final["sibling"]["text"].strip(), "SURVIVED")
+
+    def test_handle_release_cancels_child_and_cleans_up(self) -> None:
+        before = host_directories()
+        rpc = RpcPi()
+        try:
+            released = rpc.prompt(
+                '''Call ipython exactly once with this exact code and do nothing else: import asyncio
+h=await rlm.spawn("Write 20,000 numbered lines. Do not summarize or stop early.")
+await asyncio.sleep(0.1)
+await h.release()
+await rlm.final({"released": True})'''
+            )
+            result = tool_end(released)["result"]
+            self.assertEqual(result["details"]["final"], {"released": True})
+            self.assertEqual(result["details"]["children"], {"spawned": 1, "gathered": 0})
+            recovered = rpc.prompt(
+                '''Call ipython exactly once with this exact code and do nothing else: await rlm.final({"recovered": True})'''
+            )
+            self.assertEqual(
+                tool_end(recovered)["result"]["details"]["final"],
+                {"recovered": True},
+            )
+        finally:
+            rpc.close()
+        self.assert_cleanup(before)
 
     def test_active_cancellation_recovers_and_cleans_up(self) -> None:
         before = host_directories()
         rpc = RpcPi()
         try:
             cancelled = rpc.abort_after_progress(
-                '''Call ipython exactly once with this exact code and do nothing else: h=await rlm.spawn("Write 20,000 numbered lines. Do not summarize or stop early.")
-await rlm.gather([h])''',
+                """Call ipython exactly once with this exact code and do nothing else: h=await rlm.spawn("Write 20,000 numbered lines. Do not summarize or stop early.")
+await rlm.gather([h])""",
                 "Waiting for 1 RLM child",
             )
             errors = [
@@ -285,7 +496,7 @@ await rlm.gather([h])''',
             ]
             self.assertEqual(len(errors), 1)
             recovered = rpc.prompt(
-                '''Call ipython exactly once with this exact code and do nothing else: await rlm.final({"recovered": True})'''
+                """Call ipython exactly once with this exact code and do nothing else: await rlm.final({"recovered": True})"""
             )
             result = tool_end(recovered)["result"]
             self.assertTrue(result["details"]["kernelReset"])
@@ -299,12 +510,12 @@ await rlm.gather([h])''',
         rpc = RpcPi()
         try:
             rpc.abort_after_progress(
-                '''Call ipython exactly once with this exact code and do nothing else: import asyncio
-await asyncio.sleep(60)''',
+                """Call ipython exactly once with this exact code and do nothing else: import asyncio
+await asyncio.sleep(60)""",
                 "Starting IPython kernel",
             )
             recovered = rpc.prompt(
-                '''Call ipython exactly once with this exact code and do nothing else: await rlm.final({"recovered": True})'''
+                """Call ipython exactly once with this exact code and do nothing else: await rlm.final({"recovered": True})"""
             )
             self.assertEqual(tool_end(recovered)["result"]["details"]["final"], {"recovered": True})
         finally:
@@ -321,8 +532,8 @@ background=asyncio.create_task(rlm.gather([h]))
 "spawned"'''
             )
             events = rpc.prompt(
-                '''Call ipython exactly once with this exact code and do nothing else: result=(await rlm.gather([h]))[0]
-await rlm.final({"status":result["status"],"text":result["text"]})'''
+                """Call ipython exactly once with this exact code and do nothing else: result=(await rlm.gather([h]))[0]
+await rlm.final({"status":result["status"],"text":result["text"]})"""
             )
             final = tool_end(events)["result"]["details"]["final"]
             self.assertEqual(final["status"], "ok")
@@ -330,7 +541,9 @@ await rlm.final({"status":result["status"],"text":result["text"]})'''
         finally:
             rpc.close()
 
-    @unittest.skipUnless(INCLUDE_LARGE, "Set PI_RLM_TEST_INCLUDE_LARGE=1 for the costly large-context case")
+    @unittest.skipUnless(
+        INCLUDE_LARGE, "Set PI_RLM_TEST_INCLUDE_LARGE=1 for the costly large-context case"
+    )
     def test_large_context_stays_out_of_root_prompt(self) -> None:
         with tempfile.TemporaryDirectory(prefix="pi-rlm-test-") as directory:
             path = Path(directory) / "context.txt"
@@ -338,13 +551,13 @@ await rlm.final({"status":result["status"],"text":result["text"]})'''
                 for index in range(12_000):
                     label = "ALPHA" if index % 3 else "BETA"
                     output.write(f"{index:05d}|{label}|payload-{index * index:012d}\n")
-            code = f'''from pathlib import Path
+            code = f"""from pathlib import Path
 raw=Path({str(path)!r}).read_text()
 lines=raw.splitlines()
 chunks=["\\n".join(lines[:6000]),"\\n".join(lines[6000:])]
 hs=[await rlm.spawn("Count the records in this context. Reply with only the integer.",context=chunk) for chunk in chunks]
 rs=await rlm.gather(hs)
-await rlm.final({{"bytes_loaded":len(raw.encode()),"records":len(lines),"statuses":[r["status"] for r in rs],"answers":[r["text"] for r in rs]}})'''
+await rlm.final({{"bytes_loaded":len(raw.encode()),"records":len(lines),"statuses":[r["status"] for r in rs],"answers":[r["text"] for r in rs]}})"""
             events = run_print(
                 f"Call ipython exactly once with this exact code and do nothing else: {code}"
             )

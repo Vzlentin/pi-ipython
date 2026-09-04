@@ -11,8 +11,10 @@
   ],
   "scripts": {
     "typecheck": "tsc -p tsconfig.json",
+    "test:host": "node --experimental-transform-types --no-warnings tests/test_host_cancellation.mjs",
+    "test:child": "node --experimental-transform-types --no-warnings tests/test_child_completion.mjs",
     "test:static": "python3 -m unittest tests.test_static tests.test_oolong_benchmark tests.test_longbench_benchmark",
-    "test": "npm run typecheck && npm run test:static",
+    "test": "npm run typecheck && npm run test:host && npm run test:child && npm run test:static",
     "test:integration": "python3 -m unittest tests.integration.test_acceptance",
     "test:integration:full": "PI_RLM_TEST_INCLUDE_LARGE=1 python3 -m unittest tests.integration.test_acceptance",
     "eval:oolong": "uv run --python 3.12 --with-requirements benchmarks/requirements.txt python -m benchmarks.oolong",
@@ -24,8 +26,8 @@
     ]
   },
   "peerDependencies": {
-    "@earendil-works/pi-ai": "*",
-    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-ai": "~0.84.3",
+    "@earendil-works/pi-coding-agent": "~0.84.3",
     "typebox": "*"
   },
   "devDependencies": {
