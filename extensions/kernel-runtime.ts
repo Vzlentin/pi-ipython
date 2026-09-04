@@ -213,7 +213,12 @@ export class KernelRuntime {
 			`uv pip install --no-config --strict --python ${shellQuote(PYTHON_PATH)} 'ipykernel>=7,<8' 'jupyter-client>=8,<9'`,
 			`${shellQuote(PYTHON_PATH)} -I -c ${shellQuote(validation)}`,
 		].join("\n");
-		const result = await this.pi.exec("flock", ["-w", "300", PROVISION_LOCK, "bash", "-c", script], {
+		const lockCommand = process.platform === "darwin" ? "lockf" : "flock";
+		const lockArgs =
+			process.platform === "darwin"
+				? ["-k", "-t", "300", PROVISION_LOCK, "bash", "-c", script]
+				: ["-w", "300", PROVISION_LOCK, "bash", "-c", script];
+		const result = await this.pi.exec(lockCommand, lockArgs, {
 			signal,
 			timeout: PROVISION_TIMEOUT_MS,
 			cwd: EXTENSION_DIR,
