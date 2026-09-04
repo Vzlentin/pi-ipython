@@ -112,7 +112,11 @@ export default function rlmExtension(pi: ExtensionAPI) {
 		description: `Execute code in a persistent IPython kernel. Supports top-level await, native IPython magics, and the Python APIs rlm.spawn(task, context=...), rlm.gather(handles), rlm.release(handles), and rlm.final(value). Gather delivers each handle once and recovers committed results after transport loss. Child calls are limited to ${MAX_CHILDREN_RUNNING} concurrent/${MAX_LIVE_HANDLES} live handles, ${formatSize(MAX_CHILD_REQUEST_BYTES)} input, ${formatSize(MAX_CHILD_TEXT_BYTES)} returned text, and a 5-minute deadline. Output is truncated to ${DEFAULT_MAX_LINES} lines or ${formatSize(DEFAULT_MAX_BYTES)}; full truncated output is saved to a temporary file. Runaway cells exceeding ${formatSize(OUTPUT_CAPTURE_LIMIT_BYTES)} of output are stopped and reset the kernel.`,
 		promptSnippet: "Persistent IPython scratchpad with focused recursive child calls",
 		promptGuidelines: [
-			"Use rlm.spawn, rlm.gather, and rlm.final inside ipython when focused child-model fan-out can process context without placing it in the root prompt.",
+			"ipython is your persistent control environment, not the native runtime of the project. Run project code, tests, and CLIs through the project's own interface (documented commands, `uv run ...`, `.venv/bin/python ...`) and treat their result as the relevant result. Do not install project dependencies into the kernel.",
+			"Kernel state persists across cells. Assign read, search, and parsed results to named variables and reuse them instead of re-reading files or re-running commands.",
+			"Use Python for loops, parsing, and state. Use the shell only to invoke programs.",
+			"Use rlm.spawn and rlm.gather when independent, context-heavy sub-tasks can be processed without placing their context in the root prompt. Do a single known lookup, edit, or command inline.",
+			"Pass each child only the task and the context slice it needs. Gather delivers each handle once; keep handles in variables and gather them together. Use rlm.final only when the value is the complete answer.",
 		],
 		parameters,
 		executionMode: "sequential",
