@@ -139,6 +139,7 @@ function boundedError(error: unknown): string {
 
 class Semaphore {
 	private running = 0;
+	private readonly limit: number;
 	private readonly waiters: Array<{
 		resolve: (release: () => void) => void;
 		reject: (error: Error) => void;
@@ -146,7 +147,9 @@ class Semaphore {
 		onAbort: () => void;
 	}> = [];
 
-	constructor(private readonly limit: number) {}
+	constructor(limit: number) {
+		this.limit = limit;
+	}
 
 	acquire(signal: AbortSignal): Promise<() => void> {
 		if (signal.aborted) return Promise.reject(new Error("Child cancelled before admission"));
@@ -278,11 +281,14 @@ export class RlmHostBridge {
 	private readonly children = new Set<ChildRecord>();
 	private readonly sockets = new Set<Socket>();
 	private readonly limiter = new Semaphore(MAX_CHILDREN_RUNNING);
+	private readonly completeChild: CompleteChild;
 	private starting?: Promise<void>;
 	private resetting?: Promise<void>;
 	private disposed = false;
 
-	constructor(private readonly completeChild: CompleteChild) {}
+	constructor(completeChild: CompleteChild) {
+		this.completeChild = completeChild;
+	}
 
 	get environment(): Record<string, string> {
 		if (!this.socketPath) throw new Error("RLM host bridge has not started");

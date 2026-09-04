@@ -9,10 +9,13 @@
     "ipython",
     "rlm"
   ],
+  "engines": {
+    "node": ">=22.18.0"
+  },
   "scripts": {
     "typecheck": "tsc -p tsconfig.json",
-    "test:host": "node --experimental-transform-types --no-warnings tests/test_host_cancellation.mjs",
-    "test:child": "node --experimental-transform-types --no-warnings tests/test_child_completion.mjs",
+    "test:host": "node --no-warnings tests/test_host_cancellation.mjs",
+    "test:child": "node --no-warnings tests/test_child_completion.mjs",
     "test:static": "python3 -m unittest tests.test_static tests.test_oolong_benchmark tests.test_longbench_benchmark",
     "test": "npm run typecheck && npm run test:host && npm run test:child && npm run test:static",
     "test:integration": "python3 -m unittest tests.integration.test_acceptance",

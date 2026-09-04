@@ -87,12 +87,11 @@ export class KernelRuntime {
 	private pendingResetNotice = false;
 	private disposed = false;
 	private readonly lifecycle = new AbortController();
+	private readonly pi: ExtensionAPI;
 	private readonly host: RlmHostBridge;
 
-	constructor(
-		private readonly pi: ExtensionAPI,
-		completeChild: CompleteChild,
-	) {
+	constructor(pi: ExtensionAPI, completeChild: CompleteChild) {
+		this.pi = pi;
 		this.host = new RlmHostBridge(completeChild);
 	}
 
