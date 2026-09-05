@@ -79,6 +79,7 @@ Optional environment variables:
 - `PI_RLM_TEST_THINKING` — defaults to `low`.
 - `PI_RLM_TEST_TIMEOUT` — per-run seconds, defaults to `300`.
 - `PI_RLM_TEST_AGENT_DIR` — Pi agent directory used for credentials and provider settings.
+- `PI_RLM_TEST_PROVIDER_EXTENSION`: provider extension path to load for custom models, such as Cursor. Other extension discovery stays disabled.
 
 ## Paper benchmarks
 

@@ -264,7 +264,8 @@ function completeKnownChild(
 		} satisfies ModelsApiStreamOptions<"bedrock-converse-stream">);
 	}
 
-	throw new Error(`Unsupported child completion API: ${model.api}`);
+	// Pi owns custom-provider dispatch and auth, including registered streamSimple handlers.
+	return modelRegistry.complete(model, context, { ...base, reasoning });
 }
 
 export function createChildCompleter(modelRegistry: ModelRegistry): CompleteChild {

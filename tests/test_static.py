@@ -165,7 +165,7 @@ class StaticPackageTests(unittest.TestCase):
             path.read_text() for path in (TS_PATH, CHILD_TS_PATH, HOST_TS_PATH, KERNEL_TS_PATH)
         )
         self.assertIn("modelRegistry.complete(", child_completion)
-        self.assertIn("Unsupported child completion API", child_completion)
+        self.assertNotIn("Unsupported child completion API", child_completion)
         self.assertNotIn("createAgentSession", extension_source)
         self.assertNotIn("DefaultResourceLoader", extension_source)
         self.assertNotIn("SettingsManager", extension_source)

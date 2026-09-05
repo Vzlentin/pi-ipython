@@ -17,6 +17,7 @@ ROOT = Path(__file__).resolve().parents[2]
 EXTENSION = ROOT / "extensions" / "rlm.ts"
 BRIDGE = ROOT / "extensions" / "ipython.py"
 MODEL = os.environ.get("PI_RLM_TEST_MODEL")
+PROVIDER_EXTENSION = os.environ.get("PI_RLM_TEST_PROVIDER_EXTENSION")
 THINKING = os.environ.get("PI_RLM_TEST_THINKING", "low")
 TIMEOUT = int(os.environ.get("PI_RLM_TEST_TIMEOUT", "300"))
 INCLUDE_LARGE = os.environ.get("PI_RLM_TEST_INCLUDE_LARGE") == "1"
@@ -42,6 +43,7 @@ def base_command(mode: str) -> list[str]:
         "-ns",
         "-nc",
         "-nbt",
+        *(["-e", PROVIDER_EXTENSION] if PROVIDER_EXTENSION else []),
         "-e",
         str(EXTENSION),
         "--model",
