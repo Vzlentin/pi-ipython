@@ -24,10 +24,10 @@ npm test
 pi install "$PWD"
 ```
 
-`librlm/` is a `git subtree` of [Vzlentin/rlm](https://github.com/Vzlentin/rlm). Commit changes to it like any other directory. To pull upstream changes:
+`librlm/` is a `git subtree` of [alexzhang13/rlm](https://github.com/alexzhang13/rlm). Commit changes to it like any other directory. To pull upstream changes:
 
 ```bash
-git subtree pull --prefix=librlm https://github.com/Vzlentin/rlm.git main --squash
+git subtree pull --prefix=librlm https://github.com/alexzhang13/rlm.git main --squash
 ```
 
 `pi install` is needed once. Local packages are referenced by absolute path, not copied. After editing extension code, use `/reload` in Pi. Run `npm install` again only when dependencies change.
