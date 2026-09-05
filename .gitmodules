@@ -1,3 +1,0 @@
-[submodule "librlm"]
-	path = librlm
-	url = https://github.com/Vzlentin/rlm.git
