@@ -8,9 +8,11 @@ import {
 	formatSize,
 	truncateTail,
 	type ExtensionAPI,
+	type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { createChildCompleter } from "./child-completion.ts";
+import { CellsView } from "./cells.ts";
 import {
 	BRIDGE_PROTOCOL_VERSION,
 	KernelRuntime,
@@ -105,6 +107,30 @@ function hasUsage(usage: Usage): boolean {
 
 export default function rlmExtension(pi: ExtensionAPI) {
 	let runtime: KernelRuntime | undefined;
+	const cells = new CellsView(pi);
+	const getRuntime = (ctx: ExtensionContext) => runtime ??= new KernelRuntime(pi, createChildCompleter(ctx.modelRegistry));
+	const toggleCells = async (ctx: ExtensionContext) => {
+		if (ctx.mode !== "tui" || process.env.HERDR_ENV !== "1") {
+			ctx.ui.notify("/cells requires interactive Pi in Herdr.", "warning");
+			return;
+		}
+		try {
+			const connectionFile = await getRuntime(ctx).getConnectionFile(
+				ctx.cwd, ctx.signal, (message) => ctx.ui.notify(message, "info"),
+			);
+			await cells.toggle(ctx.cwd, connectionFile);
+		} catch (error) {
+			ctx.ui.notify(String(error), "error");
+		}
+	};
+	pi.registerCommand("cells", {
+		description: "Toggle an IPython console on the kernel in Herdr: recorded history, live cells, and your own input",
+		handler: async (_args, ctx) => toggleCells(ctx),
+	});
+	pi.registerShortcut("ctrl+shift+i", {
+		description: "Toggle the IPython console in Herdr",
+		handler: toggleCells,
+	});
 
 	pi.registerTool({
 		name: "ipython",
@@ -121,12 +147,15 @@ export default function rlmExtension(pi: ExtensionAPI) {
 		parameters,
 		executionMode: "sequential",
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
-			runtime ??= new KernelRuntime(pi, createChildCompleter(ctx.modelRegistry));
+			const kernel = getRuntime(ctx);
+			const transcript = ctx.mode === "tui" && process.env.HERDR_ENV === "1" ? cells : undefined;
+			transcript?.begin(params.code);
 			let latestOutput = "";
 			let lastUpdate = 0;
 			let updateTimer: ReturnType<typeof setTimeout> | undefined;
 			const progressWidgetId = "pi-ipython-rlm-progress";
 			const progress = (message: string) => {
+				transcript?.note(message);
 				if (updateTimer) {
 					clearTimeout(updateTimer);
 					updateTimer = undefined;
@@ -149,6 +178,7 @@ export default function rlmExtension(pi: ExtensionAPI) {
 				});
 			};
 			const output = (text: string) => {
+				transcript?.output(text);
 				latestOutput = text;
 				const delay = Math.max(0, 100 - (Date.now() - lastUpdate));
 				if (delay === 0) emitOutput();
@@ -157,7 +187,7 @@ export default function rlmExtension(pi: ExtensionAPI) {
 
 			let execution: Awaited<ReturnType<KernelRuntime["execute"]>>;
 			try {
-				execution = await runtime.execute(
+				execution = await kernel.execute(
 					toolCallId,
 					params.code,
 					{
@@ -169,12 +199,22 @@ export default function rlmExtension(pi: ExtensionAPI) {
 					progress,
 					output,
 				);
+			} catch (error) {
+				transcript?.finish(`error: ${String(error)}`);
+				throw error;
 			} finally {
 				if (updateTimer) clearTimeout(updateTimer);
 				if (ctx.mode === "tui") ctx.ui.setWidget(progressWidgetId, undefined);
 			}
 			const { result, kernelReset } = execution;
 			const host = result.host;
+			transcript?.output(result.output);
+			if (kernelReset) transcript?.note(RESET_NOTICE);
+			if (host.hasFinal) transcript?.note(`RLM final: ${renderFinal(host.finalValue)}`);
+			if (result.status !== "ok" && !result.output) {
+				transcript?.note([result.error?.ename, result.error?.evalue].filter(Boolean).join(": "));
+			}
+			transcript?.finish(`${result.status}${result.executionCount === undefined ? "" : ` | In [${result.executionCount}]`}`);
 			const formatted = await finalText(result.output);
 			let visible = formatted.text;
 			if (kernelReset) {
@@ -197,19 +237,30 @@ export default function rlmExtension(pi: ExtensionAPI) {
 
 			if (result.status !== "ok") {
 				const fallback = [result.error?.ename, result.error?.evalue].filter(Boolean).join(": ");
-				throw new Error(visible === "[no output]" && fallback ? fallback : visible);
+				if (visible === "[no output]" && fallback) visible = fallback;
 			}
 			return {
 				content: [{ type: "text", text: visible }],
 				details,
 				usage: hasUsage(host.usage) ? host.usage : undefined,
-				terminate: host.hasFinal || undefined,
+				terminate: (result.status === "ok" && host.hasFinal) || undefined,
 			};
 		},
 	});
 
+	// Mark failed cells without throwing away their result and child usage.
+	pi.on("tool_result", (event) => {
+		if (event.toolName === "ipython" && (event.details as IpythonDetails | undefined)?.status === "error") {
+			return { isError: true };
+		}
+	});
+
 	pi.on("session_shutdown", async () => {
-		await runtime?.shutdown();
+		try {
+			await runtime?.shutdown();
+		} finally {
+			await cells.shutdown();
+		}
 	});
 }
 

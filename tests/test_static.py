@@ -28,6 +28,13 @@ class StaticPackageTests(unittest.TestCase):
         self.assertEqual(package["name"], "pi-ipython-rlm")
         self.assertEqual(package["pi"]["extensions"], ["./extensions/rlm.ts"])
 
+    def test_cells_view_and_tool_wiring(self) -> None:
+        subprocess.run(
+            ["node", "--no-warnings", str(ROOT / "tests" / "test_cells.mjs")],
+            cwd=ROOT,
+            check=True,
+        )
+
     def test_extension_registers_only_ipython(self) -> None:
         source = TS_PATH.read_text()
         self.assertEqual(source.count("pi.registerTool({"), 1)
@@ -51,7 +58,7 @@ class StaticPackageTests(unittest.TestCase):
         self.assertEqual(ts_protocol.group(1), py_protocol.group(1))
         self.assertEqual(ts_protocol.group(1), "2")
         self.assertEqual(ts_bridge_protocol.group(1), py_bridge_protocol.group(1))
-        self.assertEqual(ts_bridge_protocol.group(1), "5")
+        self.assertEqual(ts_bridge_protocol.group(1), "6")
         self.assertEqual(internal_protocol.group(1), "5")
         self.assertNotEqual(internal_protocol.group(1), ts_protocol.group(1))
         self.assertIn("MAX_HOST_RESPONSE_BYTES = 5 * 1024 * 1024", host)
@@ -62,6 +69,15 @@ class StaticPackageTests(unittest.TestCase):
         self.assertIn("_DEFAULT_MAX_REQUEST_BYTES = 1024 * 1024", LIBRLM_ASYNC_PATH.read_text())
         self.assertIn("_HOST_TIMEOUT_SECONDS = 310", py)
         self.assertIn("DEFAULT_REQUEST_TIMEOUT = 310.0", transport)
+
+    def test_viewer_connection_file_is_host_only(self) -> None:
+        kernel = KERNEL_TS_PATH.read_text()
+        bridge = PY_PATH.read_text()
+        self.assertIn('"connection_file": str(Path(manager.connection_file).resolve())', bridge)
+        self.assertIn('typeof message.connection_file !== "string"', kernel)
+        self.assertIn("!isAbsolute(message.connection_file)", kernel)
+        self.assertIn("this.kernelConnectionFile = undefined", kernel)
+        self.assertNotIn("connectionFile:", TS_PATH.read_text())
 
     def test_async_primitives_are_owned_by_librlm(self) -> None:
         host = HOST_TS_PATH.read_text()

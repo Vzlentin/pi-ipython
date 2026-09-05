@@ -20,7 +20,7 @@ from typing import Any
 from jupyter_client import KernelManager
 
 _OUTPUT_MESSAGE_CHARS = 16_384
-_BRIDGE_PROTOCOL_VERSION = 5
+_BRIDGE_PROTOCOL_VERSION = 6
 _HOST_PROTOCOL_VERSION = 2
 _HOST_RESPONSE_LIMIT = 5 * 1024 * 1024
 _HOST_TIMEOUT_SECONDS = 310
@@ -370,6 +370,7 @@ def main() -> int:
                 "protocol": _BRIDGE_PROTOCOL_VERSION,
                 "host_protocol": _HOST_PROTOCOL_VERSION,
                 "kernel_pgid": kernel_pgid,
+                "connection_file": str(Path(manager.connection_file).resolve()),
             }
         )
 

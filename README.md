@@ -9,7 +9,17 @@ A local Pi package providing one `ipython` tool with:
 
 ## Local install
 
+Requirements:
+
+- macOS or Linux, with Bash and `lockf` (macOS) or `flock` (Linux).
+- Node.js 22.18 or newer, npm, Git, and Pi 0.84.3.
+- `uv` on `PATH`. The first tool call downloads an extension-owned Python 3.12 runtime and Jupyter dependencies, so it needs network access.
+- `python3` on `PATH` to run the tests.
+
+From the repository root:
+
 ```bash
+git submodule update --init --recursive
 npm install
 npm test
 pi install "$PWD"
@@ -22,6 +32,20 @@ For an isolated development run without touching the installed package:
 ```bash
 pi -ne -ns -nc -nbt -e ./extensions/rlm.ts
 ```
+
+## Cells in Herdr
+
+In interactive Pi inside Herdr, use `/cells` or `Ctrl+Shift+I` to toggle an IPython console on the right, attached to the same kernel. It first prints the recorded history (code, output, child progress, errors, and reset notices), then mirrors each new cell live as Pi runs it. Type at its prompt to inspect the kernel, for example `%whos`, `%history -o`, or a variable name. Cells run while the console is closed remain in the history. Your focus stays in Pi. Repeat `/cells` to close it.
+
+The console is [Jupyter Console](https://jupyter-console.readthedocs.io/) 6.6.3, started through `uv tool run` in a separate cached environment. It does not install anything into the extension-owned Python runtime. Opening `/cells` starts the kernel if needed. After a kernel reset, repeat `/cells` to reconnect. Closing the console does not stop the kernel.
+
+History is plain text, recorded from the first tool call after loading the extension. Its private temporary file is limited to 16 MiB. `/reload`, session changes, and exit close the console and delete its temporary files. The model's output limits are unchanged.
+
+**The console is interactive, not read-only.** Code entered there changes the same kernel state as Pi. Do not run code there while Pi is working. RLM child progress and terminating values remain available in Pi and in the history.
+
+## Security
+
+The kernel is not sandboxed. Code runs with your user permissions and can access local files, environment variables, and the network. The separate Python runtime isolates dependencies, not system access.
 
 ## Tests
 

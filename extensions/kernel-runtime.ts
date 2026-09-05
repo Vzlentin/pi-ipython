@@ -1,7 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 import {
@@ -28,7 +28,7 @@ const PROVISION_LOCK = join(EXTENSION_DIR, ".rlm-python.lock");
 const STARTUP_TIMEOUT_MS = 45_000;
 const PROVISION_TIMEOUT_MS = 6 * 60_000;
 export const OUTPUT_CAPTURE_LIMIT_BYTES = 1024 * 1024;
-export const BRIDGE_PROTOCOL_VERSION = 5;
+export const BRIDGE_PROTOCOL_VERSION = 6;
 
 export interface BridgeResult {
 	status: string;
@@ -56,7 +56,7 @@ function errorText(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
 
-function shellQuote(value: string): string {
+export function shellQuote(value: string): string {
 	return `'${value.replaceAll("'", `'"'"'`)}'`;
 }
 
@@ -84,6 +84,7 @@ export class KernelRuntime {
 	private stopping = false;
 	private stoppingPromise?: Promise<void>;
 	private kernelPgid?: number;
+	private kernelConnectionFile?: string;
 	private pendingResetNotice = false;
 	private disposed = false;
 	private readonly lifecycle = new AbortController();
@@ -166,11 +167,25 @@ export class KernelRuntime {
 		}
 	}
 
+	async getConnectionFile(
+		cwd: string,
+		signal: AbortSignal | undefined,
+		onProgress: (message: string) => void,
+	): Promise<string> {
+		const operationSignal = signal ? AbortSignal.any([signal, this.lifecycle.signal]) : this.lifecycle.signal;
+		await this.ensureStarted(cwd, operationSignal, onProgress);
+		if (operationSignal.aborted || !this.ready || !this.kernelConnectionFile) {
+			throw new Error("IPython kernel is not ready for a viewer");
+		}
+		return this.kernelConnectionFile;
+	}
+
 	private async ensureStarted(
 		cwd: string,
 		signal: AbortSignal | undefined,
 		onProgress: (message: string) => void,
 	): Promise<void> {
+		if (this.disposed) throw new Error("IPython runtime is shutting down");
 		if (this.stoppingPromise) await this.stoppingPromise;
 		if (this.child && this.ready) return;
 		if (!this.starting) {
@@ -329,7 +344,13 @@ export class KernelRuntime {
 				this.kill();
 				return;
 			}
+			if (typeof message.connection_file !== "string" || !isAbsolute(message.connection_file)) {
+				this.readyWaiter?.reject(new Error("IPython bridge reported an invalid kernel connection file"));
+				this.kill();
+				return;
+			}
 			this.kernelPgid = message.kernel_pgid;
+			this.kernelConnectionFile = message.connection_file;
 			this.ready = true;
 			this.readyWaiter?.resolve();
 			return;
@@ -444,6 +465,7 @@ export class KernelRuntime {
 		const kernelPgid = this.kernelPgid;
 		this.child = undefined;
 		this.kernelPgid = undefined;
+		this.kernelConnectionFile = undefined;
 		this.ready = false;
 		this.stopping = false;
 		const diagnostics = this.stderr.trim();

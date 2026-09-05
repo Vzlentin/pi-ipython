@@ -278,6 +278,16 @@ class BridgeWorkingDirectoryAcceptanceTests(unittest.TestCase):
             self.assertEqual(second_output.splitlines(), [str(second_cwd), "child-ok"])
 
 
+class ViewerConnectionAcceptanceTests(unittest.TestCase):
+    def test_connection_reset_and_viewer_cleanup(self) -> None:
+        subprocess.run(
+            ["node", "--no-warnings", str(ROOT / "tests" / "test_cells.mjs"), "--kernel"],
+            cwd=ROOT,
+            check=True,
+            timeout=120,
+        )
+
+
 class RpcPi:
     def __init__(self) -> None:
         self.process = subprocess.Popen(
@@ -426,6 +436,42 @@ await rlm.final({"statuses":[r["status"] for r in rs],"texts":[r["text"] for r i
         self.assertIn("line-11", waiting)
         self.assertTrue(any(text.startswith("RLM children completed: 2/2") for text in progress))
         self.assertIn("[RLM final — terminating]", result["content"][0]["text"])
+
+    def test_failed_cell_preserves_child_usage_once(self) -> None:
+        rpc = RpcPi()
+        try:
+            events = rpc.prompt(
+                '''Call ipython exactly once with this exact code. The error is intentional; do not retry or fix it: h=await rlm.spawn("Reply with exactly ALPHA.")
+child=(await rlm.gather([h]))[0]
+raise ValueError("intentional failure after gather")'''
+            )
+            end = tool_end(events)
+            result = end["result"]
+            self.assertTrue(end["isError"])
+            self.assertIn("intentional failure after gather", result["content"][0]["text"])
+            self.assertIn("usage", result)
+            self.assertGreater(result["usage"]["totalTokens"], 0)
+            self.assertEqual(result["details"]["status"], "error")
+            self.assertEqual(result["details"]["nestedUsage"], result["usage"])
+            messages = [
+                event["message"]
+                for event in events
+                if event.get("type") == "message_end"
+                and event["message"].get("role") == "toolResult"
+            ]
+            self.assertEqual(len(messages), 1)
+            self.assertTrue(messages[0]["isError"])
+            self.assertEqual(messages[0]["usage"], result["usage"])
+
+            recovered = tool_end(rpc.prompt(
+                '''Call ipython exactly once with this exact code and do nothing else: await rlm.final(child)'''
+            ))["result"]
+            self.assertEqual(recovered["details"]["final"]["status"], "ok")
+            self.assertEqual(recovered["details"]["final"]["usage"], result["usage"])
+            self.assertFalse(recovered.get("usage"))
+            self.assertFalse(recovered["details"]["kernelReset"])
+        finally:
+            rpc.close()
 
     def test_atomic_concurrent_gather(self) -> None:
         prompt = """Call ipython exactly once with this exact code and do nothing else: import asyncio
