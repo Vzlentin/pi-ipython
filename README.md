@@ -19,10 +19,15 @@ Requirements:
 From the repository root:
 
 ```bash
-git submodule update --init --recursive
 npm install
 npm test
 pi install "$PWD"
+```
+
+`librlm/` is a `git subtree` of [Vzlentin/rlm](https://github.com/Vzlentin/rlm). Commit changes to it like any other directory. To pull upstream changes:
+
+```bash
+git subtree pull --prefix=librlm https://github.com/Vzlentin/rlm.git main --squash
 ```
 
 `pi install` is needed once. Local packages are referenced by absolute path, not copied. After editing extension code, use `/reload` in Pi. Run `npm install` again only when dependencies change.
