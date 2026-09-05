@@ -88,9 +88,11 @@ def host_directories() -> set[Path]:
     return set(Path("/tmp").glob("pi-rlm-host-*"))
 
 
-def bridge_processes() -> list[str]:
-    result = subprocess.run(["ps", "-eo", "cmd="], stdout=subprocess.PIPE, text=True, check=True)
-    return [line for line in result.stdout.splitlines() if str(BRIDGE) in line]
+def bridge_processes() -> set[str]:
+    result = subprocess.run(
+        ["ps", "-axww", "-o", "pid=,command="], stdout=subprocess.PIPE, text=True, check=True
+    )
+    return {line.strip() for line in result.stdout.splitlines() if str(BRIDGE) in line}
 
 
 def bridge_command() -> list[str]:
@@ -158,7 +160,7 @@ def execute_bridge(
 class BridgeWorkingDirectoryAcceptanceTests(unittest.TestCase):
     def test_persistent_kernel_applies_each_cwd_to_cells_and_children(self) -> None:
         with tempfile.TemporaryDirectory(prefix="pi-rlm-bridge-cwd-") as directory:
-            root = Path(directory)
+            root = Path(directory).resolve()
             first_cwd = root / "first"
             second_cwd = root / "second"
             first_cwd.mkdir()
@@ -389,10 +391,11 @@ class RpcPi:
 
 @unittest.skipUnless(MODEL, "Set PI_RLM_TEST_MODEL to run model-backed acceptance tests")
 class Slice2AcceptanceTests(unittest.TestCase):
-    def assert_cleanup(self, before: set[Path]) -> None:
+    def assert_cleanup(self, before: tuple[set[Path], set[str]]) -> None:
         time.sleep(1)
-        self.assertEqual(host_directories() - before, set())
-        self.assertEqual(bridge_processes(), [])
+        directories, processes = before
+        self.assertEqual(host_directories() - directories, set())
+        self.assertEqual(bridge_processes() - processes, set())
 
     def test_parallel_progress_final_and_usage(self) -> None:
         prompt = """Call ipython exactly once with this exact code and do nothing else: import asyncio
@@ -456,7 +459,7 @@ await rlm.final({"failed":failed,"sibling":{"status":result["status"],"text":res
         self.assertEqual(final["sibling"]["text"].strip(), "SURVIVED")
 
     def test_handle_release_cancels_child_and_cleans_up(self) -> None:
-        before = host_directories()
+        before = host_directories(), bridge_processes()
         rpc = RpcPi()
         try:
             released = rpc.prompt(
@@ -481,7 +484,7 @@ await rlm.final({"released": True})'''
         self.assert_cleanup(before)
 
     def test_active_cancellation_recovers_and_cleans_up(self) -> None:
-        before = host_directories()
+        before = host_directories(), bridge_processes()
         rpc = RpcPi()
         try:
             cancelled = rpc.abort_after_progress(
@@ -506,7 +509,7 @@ await rlm.gather([h])""",
         self.assert_cleanup(before)
 
     def test_startup_cancellation_recovers_and_cleans_up(self) -> None:
-        before = host_directories()
+        before = host_directories(), bridge_processes()
         rpc = RpcPi()
         try:
             rpc.abort_after_progress(
