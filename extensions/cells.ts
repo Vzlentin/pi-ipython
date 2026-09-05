@@ -2,6 +2,7 @@ import { appendFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { stripVTControlCharacters } from "node:util";
+import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { shellQuote } from "./kernel-runtime.ts";
 
@@ -116,10 +117,13 @@ export class CellsView {
 		// Keep a private copy: if the kernel exits during launch, the console must not create a new kernel.
 		const connectionCopy = join(dirname(file), "kernel.json");
 		writeFileSync(connectionCopy, readFileSync(connectionFile), { mode: 0o600 });
-		// Print recorded history, then attach an interactive console that mirrors cells from Pi.
+		// History stays in terminal scrollback; Euporie renders new cells without replaying old code.
 		const command = `cat ${shellQuote(file)}; exec ${[
-			"uv", "tool", "run", "--no-config", "--python", "3.12", "--from", "jupyter-console==6.6.3",
-			"jupyter-console", "--existing", connectionCopy, "--ZMQTerminalInteractiveShell.include_other_output=True",
+			// Euporie needs a discoverable kernelspec even when attaching to an existing kernel.
+			"env", `JUPYTER_PATH=${fileURLToPath(new URL("./.rlm-python/share/jupyter", import.meta.url))}`,
+			"uv", "tool", "run", "--no-config", "--python", "3.12", "--from", "euporie==2.10.4",
+			"euporie-console", "--connection-file", connectionCopy, "--kernel-name", "python3",
+			"--show-remote-inputs", "--show-remote-outputs", "--no-mouse-support", "--no-lsp",
 		].map(shellQuote).join(" ")}`;
 		// ponytail: after a kernel reset, repeat /cells to reconnect; automate only if this becomes disruptive.
 		const target = (await this.herdr(["pane", "current", "--current"]))?.pane;

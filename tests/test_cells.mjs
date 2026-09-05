@@ -99,8 +99,8 @@ try {
 	assert.equal(panes.size, 1);
 	assert.equal(nextPane, 1);
 	const command = calls.find((args) => args[1] === "run")[3];
-	assert.match(command, /; cat '[^']+'; exec 'uv' 'tool' 'run' .*'--from' 'jupyter-console==6\.6\.3' 'jupyter-console' '--existing' /);
-	assert.match(command, /'--ZMQTerminalInteractiveShell\.include_other_output=True'$/);
+	assert.match(command, /; cat '[^']+'; exec 'env' 'JUPYTER_PATH=[^']+\/extensions\/\.rlm-python\/share\/jupyter' 'uv' 'tool' 'run' .*'--from' 'euporie==2\.10\.4' 'euporie-console' '--connection-file' /);
+	assert.match(command, /'--kernel-name' 'python3' '--show-remote-inputs' '--show-remote-outputs' '--no-mouse-support' '--no-lsp'$/);
 	const file = command.match(/cat '([^']+)';/)[1];
 	assert.equal(statSync(file).mode & 0o777, 0o600);
 	const text = readFileSync(file, "utf8");
@@ -192,7 +192,7 @@ const live = new CellsView(pi);
 try {
 	await live.toggle(cwd, firstConnection);
 	const command = calls.filter((args) => args[1] === "run").at(-1)[3];
-	const copy = command.match(/'--existing' '([^']+)'/)[1];
+	const copy = command.match(/'--connection-file' '([^']+)'/)[1];
 	assert.notEqual(copy, firstConnection);
 	assert.equal(statSync(copy).mode & 0o777, 0o600);
 	assert.equal(readFileSync(copy, "utf8"), readFileSync(firstConnection, "utf8"));
@@ -255,7 +255,7 @@ try {
 	await commands.get("cells").handler("", ctx);
 	assert.equal(connectionRequests, 1);
 	const command = calls.filter((args) => args[1] === "run").at(-1)[3];
-	assert.match(command, /'jupyter-console' '--existing'/);
+	assert.match(command, /'euporie-console' '--connection-file'/);
 	const file = command.match(/cat '([^']+)';/)[1];
 	assert.match(readFileSync(file, "utf8"), />>> await rlm.final\('answer'\)/);
 	assert.match(readFileSync(file, "utf8"), /streamed output/);
