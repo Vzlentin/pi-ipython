@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
+import { LIBRLM_ROOT } from "./librlm.ts";
 import {
 	DEFAULT_MAX_BYTES,
 	DEFAULT_MAX_LINES,
@@ -266,6 +267,7 @@ export class KernelRuntime {
 				NO_COLOR: "1",
 				PYTHONUNBUFFERED: "1",
 				RLM_KERNEL_CWD: cwd,
+				RLM_LIBRLM_ROOT: LIBRLM_ROOT,
 			},
 			stdio: ["pipe", "pipe", "pipe"],
 		});

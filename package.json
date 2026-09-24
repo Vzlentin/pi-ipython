@@ -10,14 +10,16 @@
     "rlm"
   ],
   "engines": {
-    "node": ">=22.18.0"
+    "node": ">=22.19.0"
   },
   "scripts": {
     "typecheck": "tsc -p tsconfig.json",
     "test:host": "node --no-warnings tests/test_host_cancellation.mjs",
     "test:child": "node --no-warnings tests/test_child_completion.mjs",
-    "test:static": "python3 -m unittest tests.test_static tests.test_oolong_benchmark tests.test_longbench_benchmark",
-    "test": "npm run typecheck && npm run test:host && npm run test:child && npm run test:static",
+    "test:discovery": "node --no-warnings tests/test_librlm.mjs",
+    "test:benchmarks": "python3 -m unittest tests.test_oolong_benchmark tests.test_longbench_benchmark",
+    "test:kernel": "python3 -m unittest tests.integration.test_acceptance.BridgeWorkingDirectoryAcceptanceTests tests.integration.test_acceptance.ViewerConnectionAcceptanceTests",
+    "test": "npm run typecheck && npm run test:host && npm run test:child && npm run test:discovery && npm run test:benchmarks && npm run test:kernel",
     "test:integration": "python3 -m unittest tests.integration.test_acceptance",
     "test:integration:full": "PI_RLM_TEST_INCLUDE_LARGE=1 python3 -m unittest tests.integration.test_acceptance",
     "eval:oolong": "uv run --python 3.12 --with-requirements benchmarks/requirements.txt python -m benchmarks.oolong",
@@ -29,13 +31,13 @@
     ]
   },
   "peerDependencies": {
-    "@earendil-works/pi-ai": "~0.84.3",
-    "@earendil-works/pi-coding-agent": "~0.84.3",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
     "typebox": "*"
   },
   "devDependencies": {
-    "@earendil-works/pi-ai": "0.84.3",
-    "@earendil-works/pi-coding-agent": "0.84.3",
+    "@earendil-works/pi-ai": "0.87.1",
+    "@earendil-works/pi-coding-agent": "0.87.1",
     "@types/node": "22.19.7",
     "typebox": "1.3.7",
     "typescript": "5.9.3"

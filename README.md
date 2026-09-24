@@ -1,6 +1,8 @@
 # pi-ipython-rlm
 
-A local Pi package providing one `ipython` tool with:
+The Pi IPython integration, separate from the standalone `librlm` library.
+The package/repository name remains `pi-ipython-rlm`; it no longer vendors librlm.
+It provides one `ipython` tool with:
 
 - a persistent, extension-owned Jupyter/IPython kernel;
 - top-level `await` and native IPython behavior;
@@ -12,9 +14,10 @@ A local Pi package providing one `ipython` tool with:
 Requirements:
 
 - macOS or Linux, with Bash and `lockf` (macOS) or `flock` (Linux).
-- Node.js 22.18 or newer, npm, Git, and Pi 0.84.3.
+- Node.js 22.19 or newer, npm, Git, and Pi (tested with 0.87.1).
 - `uv` on `PATH`. The first tool call downloads an extension-owned Python 3.12 runtime and Jupyter dependencies, so it needs network access.
 - `python3` on `PATH` to run the tests.
+- A separate librlm checkout containing `rlm/bridge.py` and `rlm/prompts/ipython.json`.
 
 From the repository root:
 
@@ -24,11 +27,25 @@ npm test
 pi install "$PWD"
 ```
 
-`librlm/` is a `git subtree` of [alexzhang13/rlm](https://github.com/alexzhang13/rlm). Commit changes to it like any other directory. To pull upstream changes:
+The shared runtime and instructions live in the independent `librlm` checkout.
+It defaults to `~/Dev/librlm`, independently of the extension's install location.
+Set `RLM_LIBRLM_ROOT=/absolute/path/to/librlm` before launching Pi to override it
+(`~/...` is also accepted). Relative/empty overrides and missing runtimes fail
+explicitly; there is no bundled-copy or sibling-checkout fallback. This works
+for local packages and Pi-managed Git checkouts alike.
 
-```bash
-git subtree pull --prefix=librlm https://github.com/alexzhang13/rlm.git main --squash
-```
+The extension keeps its own Python 3.12 runtime and delegates the Jupyter bridge
+to `librlm/rlm/bridge.py`. It does not install librlm's full provider dependencies
+into that runtime. Hermes has its own interpreter and model routing.
+
+Librlm owns the async primitives and shared tool instructions in
+`rlm/prompts/ipython.json`. Pi owns model routing, UI, output limits, and its
+interpreter policy. Hermes consumes the same bridge and instructions through
+`librlm/integrations/hermes/ipython-rlm`.
+
+The former subtree was extracted with its original history at commit
+`41187970d0a7bebcaeb2db403fd2f6c3e061a11f`; future core changes belong in the
+standalone repository. The upstream remote there is `alexzhang13/rlm`.
 
 `pi install` is needed once. Local packages are referenced by absolute path, not copied. After editing extension code, use `/reload` in Pi. Run `npm install` again only when dependencies change.
 
@@ -56,11 +73,14 @@ The kernel is not sandboxed. Code runs with your user permissions and can access
 
 ## Tests
 
-Fast, model-free checks:
+Model-free checks, including real persistent kernels and cancellation/recovery:
 
 ```bash
 npm test
 ```
+
+See [tests/README.md](tests/README.md) for optional model-backed acceptance checks.
+Tests assert observable behavior, not source text or implementation layout.
 
 ## Paper benchmarks
 
