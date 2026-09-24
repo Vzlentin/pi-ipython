@@ -1,7 +1,6 @@
 node_modules/
-benchmark-results/
-extensions/.rlm-python/
-extensions/.rlm-python.lock
+extensions/.python/
+extensions/.python.lock
 **/__pycache__/
 *.py[cod]
 .coverage

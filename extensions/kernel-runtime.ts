@@ -4,7 +4,6 @@ import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
-import { LIBRLM_ROOT } from "./librlm.ts";
 import {
 	DEFAULT_MAX_BYTES,
 	DEFAULT_MAX_LINES,
@@ -12,31 +11,35 @@ import {
 	truncateTail,
 	type ExtensionAPI,
 } from "@earendil-works/pi-coding-agent";
-import {
-	type ChildConfig,
-	type CompleteChild,
-	type ExecutionSummary,
-	HOST_PROTOCOL_VERSION,
-	parseExecutionSummary,
-	RlmHostBridge,
-} from "./rlm-host.ts";
 
 const EXTENSION_DIR = dirname(fileURLToPath(import.meta.url));
-const BRIDGE_PATH = join(EXTENSION_DIR, "ipython.py");
-const RUNTIME_DIR = join(EXTENSION_DIR, ".rlm-python");
+const BRIDGE_PATH = join(EXTENSION_DIR, "bridge.py");
+const RUNTIME_DIR = join(EXTENSION_DIR, ".python");
 const PYTHON_PATH = join(RUNTIME_DIR, "bin", "python");
-const PROVISION_LOCK = join(EXTENSION_DIR, ".rlm-python.lock");
+const PROVISION_LOCK = join(EXTENSION_DIR, ".python.lock");
 const STARTUP_TIMEOUT_MS = 45_000;
 const PROVISION_TIMEOUT_MS = 6 * 60_000;
 export const OUTPUT_CAPTURE_LIMIT_BYTES = 1024 * 1024;
-export const BRIDGE_PROTOCOL_VERSION = 6;
+export const BRIDGE_PROTOCOL_VERSION = 1;
+export const KERNEL_STARTING_EVENT = "ipython:kernel-starting";
+
+/**
+ * Emitted on `pi.events` before every kernel start. Listeners must write to it
+ * before their first `await`: add environment variables for the bridge and
+ * kernel, snippets to run hidden once the kernel is ready, and promises to await
+ * before spawning.
+ */
+export interface KernelStartingEvent {
+	env: Record<string, string>;
+	startupCode: string[];
+	waitFor(promise: Promise<unknown>): void;
+}
 
 export interface BridgeResult {
 	status: string;
 	executionCount?: number;
 	error?: { ename?: string; evalue?: string };
 	output: string;
-	host: ExecutionSummary;
 }
 
 interface ActiveExecution {
@@ -90,82 +93,72 @@ export class KernelRuntime {
 	private disposed = false;
 	private readonly lifecycle = new AbortController();
 	private readonly pi: ExtensionAPI;
-	private readonly host: RlmHostBridge;
 
-	constructor(pi: ExtensionAPI, completeChild: CompleteChild) {
+	constructor(pi: ExtensionAPI) {
 		this.pi = pi;
-		this.host = new RlmHostBridge(completeChild);
 	}
 
 	async execute(
 		requestId: string,
 		code: string,
-		config: ChildConfig,
+		cwd: string,
 		signal: AbortSignal | undefined,
 		onProgress: (message: string) => void,
 		onOutput: (output: string) => void,
 	): Promise<{ result: BridgeResult; kernelReset: boolean }> {
 		if (this.disposed) throw new Error("IPython runtime is shutting down");
 		const operationSignal = signal ? AbortSignal.any([signal, this.lifecycle.signal]) : this.lifecycle.signal;
-		await this.ensureStarted(config.cwd, operationSignal, onProgress);
+		await this.ensureStarted(cwd, operationSignal, onProgress);
 		if (!this.child || !this.ready) throw new Error("IPython kernel did not start");
 		if (this.active) throw new Error("IPython kernel is already executing a cell");
 		if (operationSignal.aborted) throw new Error("IPython execution cancelled before it started");
 
 		const kernelReset = this.pendingResetNotice;
 		this.pendingResetNotice = false;
-		this.host.beginExecution(requestId, config);
-		try {
-			const result = await new Promise<BridgeResult>((resolve, reject) => {
-				const active: ActiveExecution = {
-					requestId,
-					output: "",
-					onProgress,
-					onOutput,
-					resolve,
-					reject,
-				};
-				this.active = active;
+		const result = await new Promise<BridgeResult>((resolve, reject) => {
+			const active: ActiveExecution = {
+				requestId,
+				output: "",
+				onProgress,
+				onOutput,
+				resolve,
+				reject,
+			};
+			this.active = active;
 
-				const abort = () => {
-					if (this.active !== active) return;
-					this.active = undefined;
-					this.pendingResetNotice = true;
-					void this.host.cancelExecution(requestId);
-					void this.terminate().finally(() => {
-						reject(
-							new Error(
-								"IPython execution cancelled. Associated child work was aborted and the kernel was killed, so all in-memory state was lost; the next call will start a fresh kernel.",
-							),
-						);
-					});
-				};
-				operationSignal.addEventListener("abort", abort, { once: true });
-
-				const settle = (callback: () => void) => {
-					operationSignal.removeEventListener("abort", abort);
-					callback();
-				};
-				active.resolve = (value) => settle(() => resolve(value));
-				active.reject = (error) => settle(() => reject(error));
-
-				try {
-					this.child!.stdin.write(
-						`${JSON.stringify({ type: "execute", request_id: requestId, code, cwd: config.cwd })}\n`,
-						(error) => {
-							if (error) this.handleStdinError(this.child, error);
-						},
+			const abort = () => {
+				if (this.active !== active) return;
+				this.active = undefined;
+				this.pendingResetNotice = true;
+				void this.terminate().finally(() => {
+					reject(
+						new Error(
+							"IPython execution cancelled. Associated child work was aborted and the kernel was killed, so all in-memory state was lost; the next call will start a fresh kernel.",
+						),
 					);
-				} catch (error) {
-					this.handleStdinError(this.child, error);
-				}
-			});
-			await this.host.endExecution(requestId, result.status === "ok");
-			return { result, kernelReset };
-		} catch (error) {
-			await this.host.endExecution(requestId, false);
-			throw error;
-		}
+				});
+			};
+			operationSignal.addEventListener("abort", abort, { once: true });
+
+			const settle = (callback: () => void) => {
+				operationSignal.removeEventListener("abort", abort);
+				callback();
+			};
+			active.resolve = (value) => settle(() => resolve(value));
+			active.reject = (error) => settle(() => reject(error));
+
+			try {
+				this.child!.stdin.write(
+					`${JSON.stringify({ type: "execute", request_id: requestId, code, cwd })}\n`,
+					(error) => {
+						if (error) this.handleStdinError(this.child, error);
+					},
+				);
+			} catch (error) {
+				this.handleStdinError(this.child, error);
+			}
+		});
+		return { result, kernelReset };
 	}
 
 	async getConnectionFile(
@@ -251,7 +244,14 @@ export class KernelRuntime {
 		onProgress: (message: string) => void,
 	): Promise<void> {
 		await this.ensureRuntime(signal, onProgress);
-		await this.host.ensureStarted();
+		const waits: Promise<unknown>[] = [];
+		const starting: KernelStartingEvent = {
+			env: {},
+			startupCode: [],
+			waitFor: (promise) => void waits.push(promise),
+		};
+		this.pi.events.emit(KERNEL_STARTING_EVENT, starting);
+		await Promise.all(waits);
 		if (signal?.aborted) throw new Error("IPython startup cancelled");
 		onProgress("Starting IPython kernel...");
 
@@ -263,11 +263,10 @@ export class KernelRuntime {
 			detached: process.platform !== "win32",
 			env: {
 				...process.env,
-				...this.host.environment,
+				...starting.env,
 				NO_COLOR: "1",
 				PYTHONUNBUFFERED: "1",
-				RLM_KERNEL_CWD: cwd,
-				RLM_LIBRLM_ROOT: LIBRLM_ROOT,
+				IPYTHON_KERNEL_CWD: cwd,
 			},
 			stdio: ["pipe", "pipe", "pipe"],
 		});
@@ -279,6 +278,7 @@ export class KernelRuntime {
 			this.stderr = `${this.stderr}${chunk.toString()}`.slice(-16_384);
 		});
 		child.stdin.on("error", (error) => this.handleStdinError(child, error));
+		child.stdin.write(`${JSON.stringify({ type: "startup", code: starting.startupCode })}\n`);
 		child.once("error", (error) => this.handleExit(child, `bridge spawn failed: ${error.message}`));
 		child.once("close", (code, terminatedBy) => {
 			const reason = `bridge exited${code === null ? "" : ` with code ${code}`}${terminatedBy ? ` (${terminatedBy})` : ""}`;
@@ -331,7 +331,7 @@ export class KernelRuntime {
 			return;
 		}
 		if (message.type === "ready") {
-			if (message.protocol !== BRIDGE_PROTOCOL_VERSION || message.host_protocol !== HOST_PROTOCOL_VERSION) {
+			if (message.protocol !== BRIDGE_PROTOCOL_VERSION) {
 				this.readyWaiter?.reject(new Error("IPython bridge reported an unsupported protocol version"));
 				this.kill();
 				return;
@@ -363,16 +363,6 @@ export class KernelRuntime {
 			this.failActive(`IPython bridge failed and kernel state was lost:\n${diagnostics}`);
 			this.pendingResetNotice ||= this.ready;
 			this.kill();
-			return;
-		}
-
-		if (message.type === "release" && typeof message.execution_id === "string") {
-			this.host.releaseExecution(message.execution_id);
-			return;
-		}
-		if (message.type === "activity" && typeof message.request_id === "string" && typeof message.message === "string") {
-			const current = this.active;
-			if (current && current.requestId === message.request_id) current.onProgress(message.message);
 			return;
 		}
 
@@ -424,23 +414,12 @@ export class KernelRuntime {
 			return;
 		}
 		if (message.type === "result") {
-			let host: ExecutionSummary;
-			try {
-				host = parseExecutionSummary(message.host);
-			} catch (error) {
-				this.active = undefined;
-				this.pendingResetNotice = true;
-				active.reject(new Error(`IPython bridge returned an invalid execution summary: ${errorText(error)}`));
-				this.kill();
-				return;
-			}
 			this.active = undefined;
 			active.resolve({
 				status: String(message.status ?? "error"),
 				executionCount: typeof message.execution_count === "number" ? message.execution_count : undefined,
 				error: message.error,
 				output: active.output,
-				host,
 			});
 		}
 	}
@@ -475,7 +454,6 @@ export class KernelRuntime {
 		this.readyWaiter?.reject(new Error(`IPython ${reason}${suffix}`));
 		if (!expected) {
 			if (kernelPgid) this.terminateProcessGroup(kernelPgid);
-			void this.host.resetGeneration();
 			this.pendingResetNotice ||= hadState;
 			this.failActive(`IPython ${reason}. The kernel stopped and all in-memory state was lost.${suffix}`);
 		}
@@ -528,7 +506,7 @@ export class KernelRuntime {
 				} catch {}
 			}
 		});
-		const stopping = Promise.all([processStopping, this.host.resetGeneration()]).then(() => this.reapProcessGroup(kernelPgid));
+		const stopping = processStopping.then(() => this.reapProcessGroup(kernelPgid));
 		const tracked = stopping.finally(() => {
 			if (this.kernelPgid === kernelPgid) this.kernelPgid = undefined;
 			if (this.stoppingPromise === tracked) this.stoppingPromise = undefined;
@@ -604,6 +582,5 @@ export class KernelRuntime {
 			});
 		}
 		await this.reapProcessGroup(kernelPgid);
-		await this.host.shutdown();
 	}
 }

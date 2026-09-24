@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CellsView } from "../extensions/cells.ts";
 import { KernelRuntime } from "../extensions/kernel-runtime.ts";
-import rlmExtension from "../extensions/rlm.ts";
+import ipythonExtension from "../extensions/ipython.ts";
 
 const originalHerdr = process.env.HERDR_ENV;
 process.env.HERDR_ENV = "1";
@@ -99,7 +99,7 @@ try {
 	assert.equal(panes.size, 1);
 	assert.equal(nextPane, 1);
 	const command = calls.find((args) => args[1] === "run")[3];
-	assert.match(command, /; cat '[^']+'; exec 'env' 'JUPYTER_PATH=[^']+\/extensions\/\.rlm-python\/share\/jupyter' 'uv' 'tool' 'run' .*'--from' 'euporie==2\.10\.4' 'euporie-console' '--connection-file' /);
+	assert.match(command, /; cat '[^']+'; exec 'env' 'JUPYTER_PATH=[^']+\/extensions\/\.python\/share\/jupyter' 'uv' 'tool' 'run' .*'--from' 'euporie==2\.10\.4' 'euporie-console' '--connection-file' /);
 	assert.match(command, /'--kernel-name' 'python3' '--show-remote-inputs' '--show-remote-outputs' '--no-mouse-support' '--no-lsp'$/);
 	const file = command.match(/cat '([^']+)';/)[1];
 	assert.equal(statSync(file).mode & 0o777, 0o600);
@@ -216,7 +216,7 @@ let shortcut;
 const commands = new Map();
 const events = new Map();
 const notices = [];
-rlmExtension({
+ipythonExtension({
 	...pi,
 	registerTool(value) { tool = value; },
 	registerCommand(name, value) { commands.set(name, value); },
@@ -237,29 +237,26 @@ let connectionRequests = 0;
 let executions = 0;
 try {
 	KernelRuntime.prototype.getConnectionFile = async () => { connectionRequests++; return firstConnection; };
-	KernelRuntime.prototype.execute = async (_id, _code, _config, _signal, progress, output) => {
+	KernelRuntime.prototype.execute = async (_id, _code, _cwd, _signal, progress, output) => {
 		executions++;
-		progress("children completed: 1/1");
+		progress("Starting IPython kernel...");
 		output("streamed output\n");
 		return {
 			kernelReset: true,
-			result: {
-				status: "ok", executionCount: 1, output: "streamed output\n",
-				host: { hasFinal: true, finalValue: "answer", usage: { totalTokens: 0, cost: { total: 0 } } },
-			},
+			result: { status: "ok", executionCount: 1, output: "streamed output\n" },
 		};
 	};
-	const result = await tool.execute("cell", { code: "await rlm.final('answer')" }, undefined, () => {}, ctx);
-	assert.equal(result.terminate, true);
+	const result = await tool.execute("cell", { code: "answer = 42" }, undefined, () => {}, ctx);
+	assert.equal(result.details.status, "ok");
 	// Run with the console closed, then open it: recorded history first, attached to the kernel.
 	await commands.get("cells").handler("", ctx);
 	assert.equal(connectionRequests, 1);
 	const command = calls.filter((args) => args[1] === "run").at(-1)[3];
 	assert.match(command, /'euporie-console' '--connection-file'/);
 	const file = command.match(/cat '([^']+)';/)[1];
-	assert.match(readFileSync(file, "utf8"), />>> await rlm.final\('answer'\)/);
+	assert.match(readFileSync(file, "utf8"), />>> answer = 42/);
 	assert.match(readFileSync(file, "utf8"), /streamed output/);
-	assert.match(readFileSync(file, "utf8"), /RLM final: answer/);
+	assert.match(readFileSync(file, "utf8"), /Starting IPython kernel/);
 	assert.match(readFileSync(file, "utf8"), /ipython_kernel_reset/);
 	await commands.get("cells").handler("", ctx);
 	assert.equal(panes.size, 0);
@@ -294,6 +291,7 @@ if (process.argv.includes("--kernel")) {
 	process.env.HERDR_ENV = "1";
 	const exec = promisify(execFile);
 	const kernel = new KernelRuntime({
+		events: { emit() {} },
 		async exec(command, args, options) {
 			try {
 				return { ...await exec(command, args, options), code: 0 };
@@ -301,9 +299,9 @@ if (process.argv.includes("--kernel")) {
 				return { code: error.code ?? 1, stderr: error.stderr ?? error.message, stdout: error.stdout ?? "" };
 			}
 		},
-	}, async () => { throw new Error("No model needed for viewer acceptance"); });
+	});
 	const view = new CellsView(pi);
-	const config = { cwd: process.cwd(), thinkingLevel: "off" };
+	const config = { cwd: process.cwd() };
 	let recoveredConnection;
 	try {
 		const first = await kernel.getConnectionFile(config.cwd, undefined, () => {});
@@ -311,18 +309,18 @@ if (process.argv.includes("--kernel")) {
 		await view.toggle(config.cwd, first);
 		const abort = new AbortController();
 		await assert.rejects(kernel.execute("cancel", "import asyncio\nprint('ready', flush=True)\nawait asyncio.sleep(60)",
-			config, abort.signal, () => {}, (text) => { if (text.includes("ready")) abort.abort(); }), /cancelled/);
+			config.cwd, abort.signal, () => {}, (text) => { if (text.includes("ready")) abort.abort(); }), /cancelled/);
 		recoveredConnection = await kernel.getConnectionFile(config.cwd, undefined, () => {});
 		assert.notEqual(recoveredConnection, first);
 		assert.equal(existsSync(first), false);
 		await view.toggle(config.cwd, recoveredConnection);
 		assert.equal(panes.size, 1);
-		const recovered = await kernel.execute("recovered", "saved = 42\nprint(saved)", config, undefined, () => {}, () => {});
+		const recovered = await kernel.execute("recovered", "saved = 42\nprint(saved)", config.cwd, undefined, () => {}, () => {});
 		assert.equal(recovered.kernelReset, true);
 		assert.equal(recovered.result.output.trim(), "42");
 		await view.shutdown();
 		assert.equal(existsSync(recoveredConnection), true);
-		const next = await kernel.execute("after-close", "print(saved + 1)", config, undefined, () => {}, () => {});
+		const next = await kernel.execute("after-close", "print(saved + 1)", config.cwd, undefined, () => {}, () => {});
 		assert.equal(next.kernelReset, false);
 		assert.equal(next.result.output.trim(), "43");
 	} finally {

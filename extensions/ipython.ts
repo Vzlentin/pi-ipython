@@ -1,7 +1,6 @@
 import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { Usage } from "@earendil-works/pi-ai";
 import {
 	DEFAULT_MAX_BYTES,
 	DEFAULT_MAX_LINES,
@@ -11,28 +10,22 @@ import {
 	type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { createChildCompleter } from "./child-completion.ts";
 import { CellsView } from "./cells.ts";
-import { loadIpythonPrompt } from "./librlm.ts";
-import {
-	BRIDGE_PROTOCOL_VERSION,
-	KernelRuntime,
-	OUTPUT_CAPTURE_LIMIT_BYTES,
-} from "./kernel-runtime.ts";
-import {
-	HOST_PROTOCOL_VERSION,
-	MAX_CHILDREN_RUNNING,
-	MAX_CHILD_REQUEST_BYTES,
-	MAX_CHILD_TEXT_BYTES,
-	MAX_HOST_RESPONSE_BYTES,
-	MAX_LIVE_HANDLES,
-} from "./rlm-host.ts";
+import { KernelRuntime, OUTPUT_CAPTURE_LIMIT_BYTES } from "./kernel-runtime.ts";
 
 const RESET_NOTICE = [
 	"<ipython_kernel_reset>",
 	"The IPython kernel was restarted. All in-memory variables, imports, tasks, and open resources from the previous kernel were lost; recreate them before continuing.",
 	"</ipython_kernel_reset>",
 ].join("\n");
+
+const DESCRIPTION = [
+	"Execute Python in a persistent IPython kernel. Reuse variables, functions, datasets, and intermediate results across calls. Supports top-level await and native IPython magics. State lasts only for the kernel process; resets and reloads lose it. The kernel runs with local user permissions, including filesystem and network access; it is not sandboxed.",
+	"ipython is your persistent control environment, not the native runtime of the project. Run project code, tests, and CLIs through the project's own interface (documented commands, `uv run ...`, `.venv/bin/python ...`) and treat their result as the relevant result. Do not install project dependencies into the kernel.",
+	"Kernel state persists across cells, not resets or reloads. Keep reusable functions, datasets, read/search results, and intermediate computations in named variables. Save valuable results to explicit artifacts for recovery.",
+	"Use Python for loops, parsing, and state. Use the shell only to invoke programs.",
+	`Output is truncated to ${DEFAULT_MAX_LINES} lines or ${formatSize(DEFAULT_MAX_BYTES)}; full truncated output is saved to a temporary file. Runaway cells exceeding ${formatSize(OUTPUT_CAPTURE_LIMIT_BYTES)} of output are stopped and reset the kernel.`,
+].join("\n\n");
 
 const parameters = Type.Object({
 	code: Type.String({ description: "Python or an IPython cell" }),
@@ -44,12 +37,6 @@ interface IpythonDetails {
 	kernelReset?: boolean;
 	truncated?: boolean;
 	fullOutputPath?: string;
-	final?: unknown;
-	nestedUsage?: Usage;
-	children?: {
-		spawned: number;
-		gathered: number;
-	};
 }
 
 function stripAnsi(value: string): string {
@@ -96,28 +83,17 @@ async function finalText(output: string): Promise<{
 	};
 }
 
-function renderFinal(value: unknown): string {
-	if (typeof value === "string") return value;
-	const encoded = JSON.stringify(value, null, 2);
-	return encoded === undefined ? String(value) : encoded;
-}
-
-function hasUsage(usage: Usage): boolean {
-	return usage.totalTokens > 0 || usage.cost.total > 0;
-}
-
-export default function rlmExtension(pi: ExtensionAPI) {
-	const prompt = loadIpythonPrompt();
+export default function ipythonExtension(pi: ExtensionAPI) {
 	let runtime: KernelRuntime | undefined;
 	const cells = new CellsView(pi);
-	const getRuntime = (ctx: ExtensionContext) => runtime ??= new KernelRuntime(pi, createChildCompleter(ctx.modelRegistry));
+	const getRuntime = () => runtime ??= new KernelRuntime(pi);
 	const toggleCells = async (ctx: ExtensionContext) => {
 		if (ctx.mode !== "tui" || process.env.HERDR_ENV !== "1") {
 			ctx.ui.notify("/cells requires interactive Pi in Herdr.", "warning");
 			return;
 		}
 		try {
-			const connectionFile = await getRuntime(ctx).getConnectionFile(
+			const connectionFile = await getRuntime().getConnectionFile(
 				ctx.cwd, ctx.signal, (message) => ctx.ui.notify(message, "info"),
 			);
 			await cells.toggle(ctx.cwd, connectionFile);
@@ -137,18 +113,17 @@ export default function rlmExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "ipython",
 		label: "IPython",
-		description: `${prompt.api}\n\n${prompt.guidance}\n\nChild calls are limited to ${MAX_CHILDREN_RUNNING} concurrent/${MAX_LIVE_HANDLES} live handles, ${formatSize(MAX_CHILD_REQUEST_BYTES)} input, ${formatSize(MAX_CHILD_TEXT_BYTES)} returned text, and a 5-minute deadline. Output is truncated to ${DEFAULT_MAX_LINES} lines or ${formatSize(DEFAULT_MAX_BYTES)}; full truncated output is saved to a temporary file. Runaway cells exceeding ${formatSize(OUTPUT_CAPTURE_LIMIT_BYTES)} of output are stopped and reset the kernel.`,
-		promptSnippet: prompt.promptSnippet,
+		description: DESCRIPTION,
+		promptSnippet: "Persistent Python workspace for computation and data analysis",
 		parameters,
 		executionMode: "sequential",
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
-			const kernel = getRuntime(ctx);
+			const kernel = getRuntime();
 			const transcript = ctx.mode === "tui" && process.env.HERDR_ENV === "1" ? cells : undefined;
 			transcript?.begin(params.code);
 			let latestOutput = "";
 			let lastUpdate = 0;
 			let updateTimer: ReturnType<typeof setTimeout> | undefined;
-			const progressWidgetId = "pi-ipython-rlm-progress";
 			const progress = (message: string) => {
 				transcript?.note(message);
 				if (updateTimer) {
@@ -158,7 +133,6 @@ export default function rlmExtension(pi: ExtensionAPI) {
 				lastUpdate = Date.now();
 				const status = message.startsWith("Starting") || message.startsWith("Provisioning") ? "starting" : "running";
 				const text = latestOutput ? `${message}\n\n${partialText(latestOutput)}` : message;
-				if (ctx.mode === "tui") ctx.ui.setWidget(progressWidgetId, [`RLM: ${message}`]);
 				onUpdate?.({
 					content: [{ type: "text", text }],
 					details: { status } satisfies IpythonDetails,
@@ -182,30 +156,16 @@ export default function rlmExtension(pi: ExtensionAPI) {
 
 			let execution: Awaited<ReturnType<KernelRuntime["execute"]>>;
 			try {
-				execution = await kernel.execute(
-					toolCallId,
-					params.code,
-					{
-						cwd: ctx.cwd,
-						model: ctx.model,
-						thinkingLevel: ctx.thinkingLevel ?? "off",
-					},
-					signal,
-					progress,
-					output,
-				);
+				execution = await kernel.execute(toolCallId, params.code, ctx.cwd, signal, progress, output);
 			} catch (error) {
 				transcript?.finish(`error: ${String(error)}`);
 				throw error;
 			} finally {
 				if (updateTimer) clearTimeout(updateTimer);
-				if (ctx.mode === "tui") ctx.ui.setWidget(progressWidgetId, undefined);
 			}
 			const { result, kernelReset } = execution;
-			const host = result.host;
 			transcript?.output(result.output);
 			if (kernelReset) transcript?.note(RESET_NOTICE);
-			if (host.hasFinal) transcript?.note(`RLM final: ${renderFinal(host.finalValue)}`);
 			if (result.status !== "ok" && !result.output) {
 				transcript?.note([result.error?.ename, result.error?.evalue].filter(Boolean).join(": "));
 			}
@@ -215,9 +175,9 @@ export default function rlmExtension(pi: ExtensionAPI) {
 			if (kernelReset) {
 				visible = formatted.text === "[no output]" ? RESET_NOTICE : `${RESET_NOTICE}\n\n${formatted.text}`;
 			}
-			if (host.hasFinal) {
-				const finalValue = `[RLM final — terminating]\n${renderFinal(host.finalValue)}`;
-				visible = visible === "[no output]" ? finalValue : `${visible}\n\n${finalValue}`;
+			if (result.status !== "ok") {
+				const fallback = [result.error?.ename, result.error?.evalue].filter(Boolean).join(": ");
+				if (visible === "[no output]" && fallback) visible = fallback;
 			}
 			const details: IpythonDetails = {
 				status: result.status === "ok" ? "ok" : "error",
@@ -225,25 +185,12 @@ export default function rlmExtension(pi: ExtensionAPI) {
 				kernelReset,
 				truncated: formatted.truncated,
 				fullOutputPath: formatted.fullOutputPath,
-				final: host.hasFinal ? host.finalValue : undefined,
-				nestedUsage: hasUsage(host.usage) ? host.usage : undefined,
-				children: { spawned: host.spawned, gathered: host.gathered },
 			};
-
-			if (result.status !== "ok") {
-				const fallback = [result.error?.ename, result.error?.evalue].filter(Boolean).join(": ");
-				if (visible === "[no output]" && fallback) visible = fallback;
-			}
-			return {
-				content: [{ type: "text", text: visible }],
-				details,
-				usage: hasUsage(host.usage) ? host.usage : undefined,
-				terminate: (result.status === "ok" && host.hasFinal) || undefined,
-			};
+			return { content: [{ type: "text", text: visible }], details };
 		},
 	});
 
-	// Mark failed cells without throwing away their result and child usage.
+	// Mark failed cells as errors without throwing away their output.
 	pi.on("tool_result", (event) => {
 		if (event.toolName === "ipython" && (event.details as IpythonDetails | undefined)?.status === "error") {
 			return { isError: true };
@@ -258,10 +205,3 @@ export default function rlmExtension(pi: ExtensionAPI) {
 		}
 	});
 }
-
-export {
-	BRIDGE_PROTOCOL_VERSION,
-	HOST_PROTOCOL_VERSION,
-	MAX_CHILD_REQUEST_BYTES,
-	MAX_HOST_RESPONSE_BYTES,
-};

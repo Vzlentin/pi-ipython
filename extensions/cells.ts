@@ -120,7 +120,7 @@ export class CellsView {
 		// History stays in terminal scrollback; Euporie renders new cells without replaying old code.
 		const command = `cat ${shellQuote(file)}; exec ${[
 			// Euporie needs a discoverable kernelspec even when attaching to an existing kernel.
-			"env", `JUPYTER_PATH=${fileURLToPath(new URL("./.rlm-python/share/jupyter", import.meta.url))}`,
+			"env", `JUPYTER_PATH=${fileURLToPath(new URL("./.python/share/jupyter", import.meta.url))}`,
 			"uv", "tool", "run", "--no-config", "--python", "3.12", "--from", "euporie==2.10.4",
 			"euporie-console", "--connection-file", connectionCopy, "--kernel-name", "python3",
 			"--show-remote-inputs", "--show-remote-outputs", "--no-mouse-support", "--no-lsp",

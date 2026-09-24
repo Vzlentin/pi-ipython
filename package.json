@@ -1,33 +1,24 @@
 {
-  "name": "pi-ipython-rlm",
+  "name": "pi-ipython",
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Persistent IPython and focused recursive language-model calls for Pi",
+  "description": "Persistent IPython kernel tool for Pi",
   "keywords": [
     "pi-package",
-    "ipython",
-    "rlm"
+    "ipython"
   ],
   "engines": {
     "node": ">=22.19.0"
   },
   "scripts": {
     "typecheck": "tsc -p tsconfig.json",
-    "test:host": "node --no-warnings tests/test_host_cancellation.mjs",
-    "test:child": "node --no-warnings tests/test_child_completion.mjs",
-    "test:discovery": "node --no-warnings tests/test_librlm.mjs",
-    "test:benchmarks": "python3 -m unittest tests.test_oolong_benchmark tests.test_longbench_benchmark",
-    "test:kernel": "python3 -m unittest tests.integration.test_acceptance.BridgeWorkingDirectoryAcceptanceTests tests.integration.test_acceptance.ViewerConnectionAcceptanceTests",
-    "test": "npm run typecheck && npm run test:host && npm run test:child && npm run test:discovery && npm run test:benchmarks && npm run test:kernel",
-    "test:integration": "python3 -m unittest tests.integration.test_acceptance",
-    "test:integration:full": "PI_RLM_TEST_INCLUDE_LARGE=1 python3 -m unittest tests.integration.test_acceptance",
-    "eval:oolong": "uv run --python 3.12 --with-requirements benchmarks/requirements.txt python -m benchmarks.oolong",
-    "eval:longbench": "uv run --python 3.12 --with-requirements benchmarks/requirements.txt python -m benchmarks.longbench"
+    "test:kernel": "node --no-warnings tests/test_kernel.mjs && node --no-warnings tests/test_cells.mjs --kernel",
+    "test": "npm run typecheck && npm run test:kernel"
   },
   "pi": {
     "extensions": [
-      "./extensions/rlm.ts"
+      "./extensions/ipython.ts"
     ]
   },
   "peerDependencies": {
@@ -41,5 +32,6 @@
     "@types/node": "22.19.7",
     "typebox": "1.3.7",
     "typescript": "5.9.3"
-  }
+  },
+  "license": "MIT"
 }
