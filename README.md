@@ -56,10 +56,6 @@ History is plain text, recorded from the first tool call after loading the exten
 
 The kernel is not sandboxed. Code runs with your user permissions and can access local files, environment variables, and the network. The separate Python runtime isolates dependencies, not system access.
 
-## Security
-
-The kernel is not sandboxed. Code runs with your user permissions and can access local files, environment variables, and the network. The separate Python runtime isolates dependencies, not system access.
-
 ## Tests
 
 ```bash
