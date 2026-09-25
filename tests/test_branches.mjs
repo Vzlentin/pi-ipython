@@ -39,6 +39,16 @@ try {
 	const returned = await extension.cell("print(df, later_leaf, 'abandoned' in globals())");
 	assert.match(returned.text, /\[2, 4, 6\] 99 False/);
 
+	// A cancelled restore is retried on the next call instead of leaving the other branch's names.
+	manager.branch(cleaned.entryId);
+	const cancelled = new AbortController();
+	cancelled.abort();
+	await assert.rejects(extension.cell("print('never')", { signal: cancelled.signal }), /cancelled/);
+	const retried = await extension.cell("print(df, 'later_leaf' in globals())");
+	assert.match(retried.text, /\[2, 4, 6\] False/);
+	assert.match(retried.text, /ipython_state_restored/);
+	manager.branch(later.entryId);
+
 	// A forked SessionManager carries checkpoint details and restores the parent's branch.
 	const forkManager = SessionManager.inMemory(root);
 	copyBranch(manager, forkManager);
@@ -75,12 +85,11 @@ try {
 	const manifests = join(cache, "pi-ipython", "checkpoints", "manifests");
 	chmodSync(manifests, 0o500);
 	const unsaved = await extension.cell("unsaved_live = 77");
-	await new Promise((resolve) => setTimeout(resolve, 500));
+	const stillLive = await extension.cell("print(unsaved_live)"); // runs after the failed save
 	chmodSync(manifests, 0o700);
 	assert.equal(existsSync(manifestPath(unsaved.details.checkpoint)), false);
-	const stillLive = await extension.cell("print(unsaved_live)");
 	assert.match(stillLive.text, /77/);
-	assert.match(stillLive.text, /checkpoint for this cell was not saved/i);
+	assert.match(stillLive.text, /checkpoint for the previous cell was not saved/i);
 
 	// Consecutive calls on one branch do not restore and preserve unpicklable identity.
 	await extension.cell(`live_file = open(${JSON.stringify(join(root, "live-resource"))}, 'w+')\nlive_identity = id(live_file)`);

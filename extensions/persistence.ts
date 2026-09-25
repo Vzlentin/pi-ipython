@@ -1,28 +1,53 @@
 import { randomUUID } from "node:crypto";
-import { lstatSync, readFileSync } from "node:fs";
+import { lstatSync, mkdirSync, readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import type { SessionEntry } from "@earendil-works/pi-coding-agent";
-import type { KernelRuntime } from "./kernel-runtime.ts";
+import type { ExtensionAPI, SessionEntry } from "@earendil-works/pi-coding-agent";
+import { errorText, KernelRuntime } from "./kernel-runtime.ts";
 
-export interface RestoreSummary {
-	id: string | null;
-	cell?: number | null;
-	restored?: string[];
-	skipped?: Record<string, string>;
-	fellBack?: boolean;
-}
+const RESTORE_TIMEOUT_MS = 10_000;
+const SAVE_TIMEOUT_MS = 60_000;
+const CLOSE_TIMEOUT_MS = 10_000;
+// A value whose unpickling kills the kernel is deleted by the next attempt, so each
+// attempt after the first gets past one more such value.
+const RESTORE_ATTEMPTS = 3;
 
-export function persistenceEnabled(cwd: string): boolean {
+/** Returned by `pi_ipython_state.restore`; `null` means the namespace already matches the branch. */
+type RestoreSummary =
+	| { status: "unavailable"; error: string }
+	| { status: "empty"; fellBack: boolean }
+	| {
+		status: "restored";
+		id: string;
+		cell: number;
+		restored: string[];
+		skipped: Record<string, string>;
+		fellBack: boolean;
+	};
+
+function persistenceEnabled(cwd: string): boolean {
 	if (process.env.PI_IPYTHON_PERSISTENCE === "0") return false;
 	for (let path = resolve(cwd); ; path = dirname(path)) {
+		const configPath = join(path, ".pi", "pi-ipython.json");
+		let text: string | undefined;
 		try {
-			const config = JSON.parse(readFileSync(join(path, ".pi", "pi-ipython.json"), "utf8"));
-			if (config.persistence === false) return false;
+			text = readFileSync(configPath, "utf8");
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 		}
-		try { lstatSync(join(path, ".git")); break; } catch (error) {
+		if (text !== undefined) {
+			let config: unknown;
+			try {
+				config = JSON.parse(text);
+			} catch (error) {
+				throw new Error(`Invalid IPython configuration ${configPath}: ${errorText(error)}`);
+			}
+			if ((config as { persistence?: unknown } | null)?.persistence === false) return false;
+		}
+		try {
+			lstatSync(join(path, ".git"));
+			break;
+		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 		}
 		if (dirname(path) === path) break;
@@ -30,10 +55,23 @@ export function persistenceEnabled(cwd: string): boolean {
 	return true;
 }
 
-export const cacheBase = () => resolve(process.env.XDG_CACHE_HOME || join(homedir(), ".cache"));
+/** Creates and resolves the cache base once; the kernel refuses symlinks below it. */
+function checkpointBase(): string {
+	const base = resolve(process.env.XDG_CACHE_HOME || join(homedir(), ".cache"));
+	mkdirSync(base, { recursive: true });
+	return realpathSync(base);
+}
 
-function errorText(error: unknown): string {
-	return error instanceof Error ? error.message : String(error);
+/** Creates the kernel and its checkpoints, enabled unless `cwd` opts out. */
+export function createRuntime(pi: ExtensionAPI, cwd: string): { kernel: KernelRuntime; checkpoints: Checkpoints } {
+	if (!persistenceEnabled(cwd)) {
+		const kernel = new KernelRuntime(pi);
+		return { kernel, checkpoints: new Checkpoints(kernel, false) };
+	}
+	// Runs after all other startup code, so names supplied by extensions are never checkpointed.
+	const initialize = `__import__('pi_ipython_state').initialize(get_ipython(), ${JSON.stringify(checkpointBase())})`;
+	const kernel = new KernelRuntime(pi, [initialize]);
+	return { kernel, checkpoints: new Checkpoints(kernel, true) };
 }
 
 function checkpointIds(branch: SessionEntry[]): string[] {
@@ -48,106 +86,122 @@ function checkpointIds(branch: SessionEntry[]): string[] {
 	return ids;
 }
 
-export function restoreNotice(summary: RestoreSummary): string {
-	if (summary.id === null) {
+function restoreNotice(summary: RestoreSummary): string {
+	if (summary.status === "unavailable") return `IPython checkpoint storage unavailable: ${summary.error}`;
+	if (summary.status === "empty") {
 		return [
 			"<ipython_state_restored>",
-			"No IPython cell on this branch yet; namespace reset to startup state.",
+			summary.fellBack
+				? "No checkpoint on this branch is available; namespace reset to startup state."
+				: "No IPython cell on this branch yet; namespace reset to startup state.",
 			"</ipython_state_restored>",
 		].join("\n");
 	}
-	const restored = summary.restored?.join(", ") || "none";
-	const skipped = Object.entries(summary.skipped ?? {})
+	const restored = summary.restored.join(", ") || "none";
+	const skipped = Object.entries(summary.skipped)
 		.map(([name, reason]) => `${name} (${reason})`).join("; ") || "none";
 	return [
 		"<ipython_state_restored>",
-		`Kernel state now matches this branch as of In [${summary.cell ?? "?"}]: ${restored}. Not restored: ${skipped}. Variables created on the branch you left are gone.`,
+		`Kernel state now matches this branch as of In [${summary.cell}]: ${restored}. Not restored: ${skipped}. Variables created on the branch you left are gone.`,
 		summary.fellBack ? "The newest checkpoint on this branch was unavailable; used an older one." : undefined,
 		"</ipython_state_restored>",
 	].filter(Boolean).join("\n");
 }
 
+/**
+ * Saves the namespace after each cell and restores the current branch's nearest checkpoint
+ * before the next. Which checkpoint the namespace holds is tracked inside the kernel.
+ */
 export class Checkpoints {
 	private pending: Promise<void> = Promise.resolve();
-	private held?: { generation: number; id?: string };
-	private storage?: { generation: number; available: boolean };
-	private previousSaveMs?: number;
+	private saveFailure?: string;
 	private readonly kernel: KernelRuntime;
-	private readonly directory: string;
+	private readonly enabled: boolean;
 
-	constructor(kernel: KernelRuntime, directory: string) {
+	/** With `enabled` false, sync and save do nothing. */
+	constructor(kernel: KernelRuntime, enabled: boolean) {
 		this.kernel = kernel;
-		this.directory = directory;
+		this.enabled = enabled;
 	}
 
-	async sync(branch: SessionEntry[], signal?: AbortSignal): Promise<void> {
-		await this.pending;
-		const generation = this.kernel.generation;
-		const freshKernel = this.storage?.generation !== generation;
-		if (freshKernel) {
-			try {
-				await this.kernel.evaluate(
-					`__import__('pi_ipython_state').initialize(get_ipython(), ${JSON.stringify(this.directory)})`,
-					{ signal },
-				);
-				this.storage = { generation, available: true };
-			} catch (error) {
-				this.storage = { generation, available: false };
-				this.kernel.notify(`IPython checkpoint storage unavailable: ${errorText(error)}`);
+	/** Starts the kernel and restores the branch's state. Returns notices for the next result. */
+	sync(
+		branch: SessionEntry[],
+		cwd: string,
+		signal: AbortSignal | undefined,
+		onProgress: (message: string) => void,
+	): Promise<string[]> {
+		if (!this.enabled) return Promise.resolve([]);
+		// Serialized with saves and other syncs; the kernel refuses overlapping requests as busy.
+		const run = this.pending.then(() => this.restoreBranch(checkpointIds(branch), cwd, signal, onProgress));
+		this.pending = run.then(() => {}, () => {});
+		return run;
+	}
+
+	private async restoreBranch(
+		candidates: string[],
+		cwd: string,
+		signal: AbortSignal | undefined,
+		onProgress: (message: string) => void,
+	): Promise<string[]> {
+		await this.kernel.start(cwd, signal, onProgress);
+		let notice: string | undefined;
+		for (let attempt = 1; ; attempt += 1) {
+			const generation = this.kernel.generation;
+			notice = await this.restore(candidates, signal);
+			await this.kernel.start(cwd, signal, onProgress);
+			if (this.kernel.generation === generation) break;
+			if (attempt === RESTORE_ATTEMPTS) {
+				notice = `IPython checkpoint restore killed the kernel ${RESTORE_ATTEMPTS} times; continuing on a fresh kernel. The next call retries without the values that killed it.`;
+				break;
 			}
 		}
+		const notices = [this.saveFailure, notice].filter((text): text is string => text !== undefined);
+		this.saveFailure = undefined;
+		return notices;
+	}
 
-		const candidates = checkpointIds(branch);
-		if (!this.storage?.available) {
-			this.held = { generation, id: candidates[0] };
-			return;
-		}
-		const nearest = candidates[0];
-		if (this.held?.generation === generation && this.held.id === nearest) return;
+	private async restore(candidates: string[], signal: AbortSignal | undefined): Promise<string | undefined> {
 		try {
-			const summary = await this.kernel.evaluate<RestoreSummary>(
-				`__import__('pi_ipython_state').restore(${JSON.stringify(candidates)})`,
-				{ timeoutMs: 10_000, signal },
-			);
-			this.held = { generation: this.kernel.generation, id: nearest };
-			if (!(freshKernel && summary.id === null && candidates.length === 0)) {
-				this.kernel.notify(restoreNotice(summary));
-			}
+			const summary = await this.call("restore", [candidates], { timeoutMs: RESTORE_TIMEOUT_MS, signal });
+			return summary === null ? undefined : restoreNotice(summary as RestoreSummary);
 		} catch (error) {
-			this.held = { generation: this.kernel.generation, id: nearest };
-			this.kernel.notify(`IPython checkpoint restore failed; continuing with the current namespace: ${errorText(error)}`);
+			// A cancelled restore leaves the namespace marked partial, so the next sync restores again.
+			if (signal?.aborted) throw error;
+			// A restore that failed or timed out is not retried. The kernel may be dead, in which case
+			// its successor starts with nothing loaded and the retry loop restores again.
+			await this.call("accept", [candidates[0] ?? null]).catch(() => {});
+			return `IPython checkpoint restore failed; continuing with the current namespace: ${errorText(error)}`;
 		}
 	}
 
-	save(): { id: string; previousSaveMs?: number } {
+	/** Queues a save of the namespace after a cell and returns its checkpoint ID. */
+	save(): string | undefined {
+		if (!this.enabled) return undefined;
 		const id = randomUUID();
-		const result = { id, previousSaveMs: this.previousSaveMs };
-		const generation = this.kernel.generation;
-		this.held = { generation, id };
-		if (this.storage?.generation !== generation || !this.storage.available) return result;
 		this.pending = this.pending
 			.then(() => new Promise<void>((resolve) => setImmediate(resolve)))
-			.then(async () => {
-				try {
-					const summary = await this.kernel.evaluate<{ duration?: number }>(
-						`__import__('pi_ipython_state').save(${JSON.stringify(id)})`,
-						{ timeoutMs: 60_000 },
-					);
-					this.previousSaveMs = typeof summary.duration === "number" ? summary.duration * 1000 : undefined;
-				} catch (error) {
-					this.previousSaveMs = undefined;
-					this.kernel.notify(`IPython checkpoint for this cell was not saved: ${errorText(error)}`);
-				}
+			.then(() => this.call("save", [id], { timeoutMs: SAVE_TIMEOUT_MS }))
+			.then(() => {}, (error) => {
+				this.saveFailure = `IPython checkpoint for the previous cell was not saved: ${errorText(error)}`;
 			});
-		return result;
+		return id;
 	}
 
 	async close(): Promise<void> {
 		let timer: ReturnType<typeof setTimeout> | undefined;
 		await Promise.race([
 			this.pending,
-			new Promise<void>((resolve) => { timer = setTimeout(resolve, 10_000); }),
+			new Promise<void>((resolve) => { timer = setTimeout(resolve, CLOSE_TIMEOUT_MS); }),
 		]);
 		clearTimeout(timer);
+	}
+
+	private call(name: string, args: unknown[], options: { timeoutMs?: number; signal?: AbortSignal } = {}) {
+		const payload = JSON.stringify(JSON.stringify(args));
+		return this.kernel.evaluate(
+			`__import__('pi_ipython_state').${name}(*__import__('json').loads(${payload}))`,
+			options,
+		);
 	}
 }

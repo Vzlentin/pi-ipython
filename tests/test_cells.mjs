@@ -230,16 +230,14 @@ ipythonExtension({
 	on(name, handler) { events.set(name, handler); },
 });
 const ctx = {
-	mode: "tui", cwd: process.cwd(), modelRegistry: {},
+	mode: "tui", cwd: process.cwd(), modelRegistry: {}, sessionManager: { getBranch: () => [] },
 	ui: { setWidget() {}, notify(...args) { notices.push(args); } },
 };
 const execute = KernelRuntime.prototype.execute;
-const start = KernelRuntime.prototype.start;
 const getConnectionFile = KernelRuntime.prototype.getConnectionFile;
 let connectionRequests = 0;
 let executions = 0;
 try {
-	KernelRuntime.prototype.start = async () => {};
 	KernelRuntime.prototype.getConnectionFile = async () => { connectionRequests++; return firstConnection; };
 	KernelRuntime.prototype.execute = async (_id, _code, _cwd, _signal, progress, output) => {
 		executions++;
@@ -247,7 +245,6 @@ try {
 		output("streamed output\n");
 		return {
 			kernelReset: true,
-			notice: "<ipython_kernel_reset>\nreset fixture\n</ipython_kernel_reset>",
 			result: { status: "ok", executionCount: 1, output: "streamed output\n" },
 		};
 	};
@@ -285,7 +282,6 @@ try {
 	assert.equal(calls.length, before);
 } finally {
 	KernelRuntime.prototype.execute = execute;
-	KernelRuntime.prototype.start = start;
 	KernelRuntime.prototype.getConnectionFile = getConnectionFile;
 	await events.get("session_shutdown")();
 	if (originalPersistence === undefined) delete process.env.PI_IPYTHON_PERSISTENCE;

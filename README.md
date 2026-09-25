@@ -60,7 +60,7 @@ Cancellation and output overflow first send SIGINT to the kernel process group. 
 
 By default, each completed Pi `ipython` cell receives a checkpoint ID and its public, supported variables are saved in the background. Before the next cell, the extension waits for that save and finds the nearest IPython result on the current conversation branch. Navigating with `/tree`, resuming, forking, reloading, or recovering from a crash therefore restores that branch's latest committed cell. If its newest checkpoint is unavailable, the next older committed checkpoint is used; a branch with no IPython cells resets the namespace to its startup state.
 
-The result after a restore reports its source cell, restored names, and skipped values. A failed background save does not roll back the live kernel. Each result also records the previous cell's save duration as `details.checkpointSaveMs` when available.
+The result after a restore reports its source cell, restored names, and skipped values. A failed background save does not roll back the live kernel. A failed save is reported with the next result. A cancelled restore is retried on the next call; a restore that fails or times out is not, and the cell runs on the namespace left behind. If restoring a value kills the kernel, that value is deleted from the store and the restore is retried on a fresh kernel, up to three attempts per call.
 
 Checkpointing is best-effort:
 
@@ -70,7 +70,7 @@ Checkpointing is best-effort:
 - Files written by cells are not rewound. Neither are live resources or process state such as `sys.path`, `os.environ`, the working directory, monkeypatches, imported module globals, or threads.
 - Input entered directly in `/cells` is included in the next Pi cell's checkpoint. If you navigate before another Pi cell, that console-only input is not followed to the other branch.
 
-Content-addressed blobs and per-cell manifests live in `${XDG_CACHE_HOME:-~/.cache}/pi-ipython/checkpoints/`. A global lock serializes saves and cleanup. Manifests unused for 30 days are removed, and least-recently-used manifests are evicted when the store exceeds 2 GiB; unreferenced blobs are then deleted. Manifest access during restore refreshes its recency.
+Content-addressed blobs and per-cell manifests live in `${XDG_CACHE_HOME:-~/.cache}/pi-ipython/checkpoints/`. A global lock serializes saves, restores, and cleanup across sessions; a restored value's `__setstate__` runs under it, so a slow one blocks other sessions for up to the 10-second restore deadline plus the 3-second interrupt grace. Manifests unused for 30 days are removed, and least-recently-used manifests are evicted when the store exceeds 2 GiB; unreferenced blobs are then deleted. Manifest access during restore refreshes its recency.
 
 Disable all checkpoint saves, restores, and checkpoint result details with either:
 

@@ -2,12 +2,16 @@
 
 Pickles are executable code. Only load extension-owned, non-symlink files in a
 private checkpoint directory. This is branch recovery, not an artifact format.
+
+Module globals describe this kernel and die with it: its startup names, its
+storage, and which checkpoint its namespace currently holds.
 """
 from __future__ import annotations
 
 import asyncio
+import collections
+import contextlib
 import fcntl
-import functools
 import hashlib
 import importlib
 import io
@@ -21,6 +25,7 @@ import time
 import types
 import uuid
 from pathlib import Path
+from typing import NamedTuple
 
 import cloudpickle
 
@@ -30,38 +35,67 @@ STORE_LIMIT = 2 * 1024**3
 MAX_AGE_SECONDS = 30 * 24 * 60 * 60
 _UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}")
 _BLOB = re.compile(r"[0-9a-f]{64}")
+_LOADING = "loading"
+_PARTIAL = object()
 _shell = None
 _baseline: set[str] = set()
 _directory: Path | None = None
+_storage_error: str | None = None
+_storage_error_reported = False
+_held: object = None
+
+
+class _Store(NamedTuple):
+    root: int
+    blobs: int
+    manifests: int
+
+
+class _Entry(NamedTuple):
+    name: str
+    module: str | None
+    blob: str | None
+
+
+class _Manifest(NamedTuple):
+    cell: int
+    entries: list[_Entry]
+    skipped: dict[str, str]
+    size: int
+    mtime: float
+
+    @property
+    def blobs(self) -> set[str]:
+        return {entry.blob for entry in self.entries if entry.blob is not None}
 
 
 def initialize(shell, directory: str):
-    global _shell, _baseline, _directory
-    base = Path(directory)
-    root = base / "pi-ipython" / "checkpoints"
-    for path in (root.parent, root, root / "blobs", root / "manifests"):
-        try:
-            path.mkdir(mode=0o700)
-        except FileExistsError:
-            pass
-        _check(path, directory=True)
+    """Run once per kernel, after all other startup code. Storage problems are reported by restore."""
+    global _shell, _baseline, _directory, _storage_error
     _shell = shell
     _baseline = set(shell.user_ns) | set(shell.user_ns_hidden)
-    _directory = root
-    _root()
-    return None
+    try:
+        fd = _directory_fd(Path(directory))
+        try:
+            for name in ("pi-ipython", "checkpoints"):
+                parent, fd = fd, _subdir(fd, name, create=True)
+                os.close(parent)
+            for name in ("blobs", "manifests"):
+                os.close(_subdir(fd, name, create=True))
+        finally:
+            os.close(fd)
+    except Exception as error:
+        _storage_error = f"{type(error).__name__}: {error}"
+        return
+    _directory = Path(directory) / "pi-ipython" / "checkpoints"
 
 
-def _check(path: Path, directory=False):
-    info = path.lstat()
-    if stat.S_ISLNK(info.st_mode) or info.st_uid != os.getuid():
-        raise ValueError(f"refusing symlink or unowned path: {path}")
-    expected = stat.S_ISDIR if directory else stat.S_ISREG
-    if not expected(info.st_mode):
-        raise ValueError(f"unexpected file type: {path}")
-    if info.st_mode & 0o077:
-        raise ValueError(f"checkpoint path is not private: {path}")
-    return info
+def _private(fd: int, name: str, kind=stat.S_ISDIR):
+    info = os.fstat(fd)
+    if not kind(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+        os.close(fd)
+        raise ValueError(f"refusing unsafe, unowned or non-private checkpoint path: {name}")
+    return fd
 
 
 def _directory_fd(path: Path):
@@ -69,92 +103,85 @@ def _directory_fd(path: Path):
     fd = os.open(path.anchor, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
         for part in path.parts[1:]:
-            next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
-            os.close(fd)
-            fd = next_fd
-        info = os.fstat(fd)
-        if info.st_uid != os.getuid() or info.st_mode & 0o077:
-            raise ValueError(f"refusing unowned or non-private directory: {path}")
+            parent, fd = fd, os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(parent)
         return fd
     except BaseException:
         os.close(fd)
         raise
 
 
-def _root():
-    assert _directory is not None
-    _check(_directory, directory=True)
-    fd = _directory_fd(_directory)
-    os.close(fd)
-    return _directory
+def _subdir(parent: int, name: str, create=False):
+    if create:
+        with contextlib.suppress(FileExistsError):
+            os.mkdir(name, 0o700, dir_fd=parent)
+    return _private(os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent), name)
 
 
-def _open(path: Path, flags: int):
-    parent = _directory_fd(path.parent)
+def _open(directory: int, name: str, flags: int):
+    fd = os.open(name, flags | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=directory)
+    return _private(fd, name, stat.S_ISREG)
+
+
+@contextlib.contextmanager
+def _store():
+    # Every file operation is relative to descriptors pinned here, under one store-wide lock.
+    if _directory is None:
+        raise RuntimeError(f"checkpoint storage unavailable: {_storage_error or 'not initialized'}")
+    with contextlib.ExitStack() as stack:
+        def pin(fd):
+            stack.callback(os.close, fd)
+            return fd
+        root = pin(_private(_directory_fd(_directory), str(_directory)))
+        fcntl.flock(pin(_open(root, "lock", os.O_RDWR | os.O_CREAT)), fcntl.LOCK_EX)
+        yield _Store(root, pin(_subdir(root, "blobs")), pin(_subdir(root, "manifests")))
+
+
+def _atomic_write(directory: int, name: str, data):
+    temporary = f".tmp-{uuid.uuid4().hex}"
     try:
-        fd = os.open(path.name, flags | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=parent)
-    finally:
-        os.close(parent)
-    try:
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
-            raise ValueError(f"refusing unsafe checkpoint file: {path}")
-        return fd
-    except BaseException:
-        os.close(fd)
-        raise
-
-
-def _locked(operation):
-    @functools.wraps(operation)
-    def run(*args, **kwargs):
-        fd = _open(_root() / "lock", os.O_RDWR | os.O_CREAT)
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
-            return operation(*args, **kwargs)
-        finally:
-            os.close(fd)
-    return run
-
-
-def _fsync_directory(path: Path):
-    fd = _directory_fd(path)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-
-
-def _atomic_write(path: Path, data: bytes):
-    temporary = path.parent / f".tmp-{uuid.uuid4().hex}"
-    try:
-        fd = _open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
-        with os.fdopen(fd, "wb") as file:
+        with os.fdopen(_open(directory, temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL), "wb") as file:
             file.write(data)
             file.flush()
             os.fsync(file.fileno())
-        os.replace(temporary, path)
-        _fsync_directory(path.parent)
+        os.replace(temporary, name, src_dir_fd=directory, dst_dir_fd=directory)
+        os.fsync(directory)
     finally:
-        temporary.unlink(missing_ok=True)
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(temporary, dir_fd=directory)
 
 
-def _read(path: Path, limit: int):
-    if _check(path).st_size > limit:
+def _read(directory: int, name: str, limit: int):
+    with os.fdopen(_open(directory, name, os.O_RDONLY), "rb") as file:
+        info = os.fstat(file.fileno())
+        if info.st_size > limit:
+            raise ValueError(f"checkpoint file exceeds {limit} bytes")
+        data = file.read(limit + 1)
+    if len(data) > limit:
         raise ValueError(f"checkpoint file exceeds {limit} bytes")
-    fd = _open(path, os.O_RDONLY)
-    with os.fdopen(fd, "rb") as file:
-        return file.read(limit + 1)
+    return data, info
 
 
-def _read_manifest(checkpoint_id: str):
-    path = _root() / "manifests" / f"{checkpoint_id}.json"
-    manifest = json.loads(_read(path, 4 * 1024 * 1024))
-    if manifest.get("version") != 2 or not isinstance(manifest.get("saved"), list):
+def _parse_entry(item) -> _Entry:
+    if isinstance(item, dict) and isinstance(item.get("name"), str):
+        if item.get("kind") == "module" and isinstance(item.get("module"), str):
+            return _Entry(item["name"], item["module"], None)
+        if item.get("kind") == "value" and isinstance(item.get("blob"), str) and _BLOB.fullmatch(item["blob"]):
+            return _Entry(item["name"], None, item["blob"])
+    raise ValueError("invalid checkpoint entry")
+
+
+def _read_manifest(store: _Store, checkpoint_id: str) -> _Manifest:
+    """Raise OSError or ValueError unless the manifest is readable and well formed."""
+    data, info = _read(store.manifests, f"{checkpoint_id}.json", 4 * 1024 * 1024)
+    manifest = json.loads(data)
+    if not isinstance(manifest, dict) or manifest.get("version") != 2:
+        raise ValueError("unsupported checkpoint manifest")
+    cell, saved, skipped = manifest.get("cell"), manifest.get("saved"), manifest.get("skipped")
+    if not isinstance(cell, int) or not isinstance(saved, list) or not isinstance(skipped, dict) \
+            or not all(isinstance(reason, str) for reason in skipped.values()):
         raise ValueError("invalid checkpoint manifest")
-    if not isinstance(manifest.get("skipped"), dict) or not isinstance(manifest.get("cell"), int):
-        raise ValueError("invalid checkpoint entries")
-    return path, manifest
+    return _Manifest(cell, [_parse_entry(item) for item in saved], skipped, info.st_size, info.st_mtime)
 
 
 def _cell_function(value):
@@ -219,118 +246,106 @@ def _eligible(name: str):
     return not name.startswith("_") and name not in _baseline and name not in _shell.user_ns_hidden
 
 
-def _manifest_records(root: Path):
-    records = []
-    for name in os.listdir(root / "manifests"):
-        match = re.fullmatch(r"([0-9a-f-]{36})\.json", name)
-        if not match or not _UUID.fullmatch(match.group(1)):
+def _manifests(store: _Store) -> dict[str, _Manifest]:
+    manifests = {}
+    for name in os.listdir(store.manifests):
+        checkpoint_id = name.removesuffix(".json")
+        if checkpoint_id == name or not _UUID.fullmatch(checkpoint_id):
             continue
-        path = root / "manifests" / name
-        try:
-            info = _check(path)
-            _, manifest = _read_manifest(match.group(1))
-            records.append({"id": match.group(1), "path": path, "size": info.st_size,
-                            "mtime": info.st_mtime, "manifest": manifest})
-        except (OSError, ValueError, json.JSONDecodeError):
-            continue
-    return records
+        with contextlib.suppress(OSError, ValueError):
+            manifests[checkpoint_id] = _read_manifest(store, checkpoint_id)
+    return manifests
 
 
-def _blob_sizes(root: Path):
+def _blob_sizes(store: _Store):
     sizes = {}
-    for name in os.listdir(root / "blobs"):
+    for name in os.listdir(store.blobs):
         if not _BLOB.fullmatch(name):
             continue
-        try:
-            sizes[name] = _check(root / "blobs" / name).st_size
-        except (OSError, ValueError):
-            pass
+        with contextlib.suppress(OSError):
+            info = os.stat(name, dir_fd=store.blobs, follow_symlinks=False)
+            if stat.S_ISREG(info.st_mode):
+                sizes[name] = info.st_size
     return sizes
 
 
-def _references(records):
-    return {
-        entry["blob"]
-        for record in records
-        for entry in record["manifest"]["saved"]
-        if entry.get("kind") == "value" and isinstance(entry.get("blob"), str)
-    }
-
-
-def _cleanup(root: Path, current_id: str, store_limit: int, max_age_seconds: float):
-    # A global lock and O(store) GC per save are deliberately simple. Add per-blob
-    # pins or a GC stamp file if checkpoint save durations show this is costly.
-    records = _manifest_records(root)
-    blobs = _blob_sizes(root)
-    kept = list(records)
+def _cleanup(store: _Store, current_id: str, store_limit: int, max_age_seconds: float):
+    # A global lock and a full store scan per save are deliberately simple. Add a GC
+    # stamp file if checkpoint save durations show the scan is costly.
+    manifests = _manifests(store)
+    blobs = _blob_sizes(store)
+    references = collections.Counter(digest for manifest in manifests.values() for digest in manifest.blobs)
+    total = sum(manifest.size for manifest in manifests.values()) + sum(blobs.get(digest, 0) for digest in references)
     now = time.time()
-
-    def size():
-        references = _references(kept)
-        return sum(record["size"] for record in kept) + sum(
-            bytes_ for digest, bytes_ in blobs.items() if digest in references
-        )
-
-    for record in sorted(records, key=lambda item: item["mtime"]):
-        if record["id"] == current_id:
+    for checkpoint_id, manifest in sorted(manifests.items(), key=lambda item: item[1].mtime):
+        if checkpoint_id == current_id:
             continue
-        if now - record["mtime"] > max_age_seconds or size() > store_limit:
-            kept.remove(record)
-            record["path"].unlink()
-    referenced = _references(kept)
-    for digest in blobs:
-        if digest not in referenced:
-            (root / "blobs" / digest).unlink()
-    _fsync_directory(root / "manifests")
-    _fsync_directory(root / "blobs")
+        if now - manifest.mtime <= max_age_seconds and total <= store_limit:
+            continue
+        os.unlink(f"{checkpoint_id}.json", dir_fd=store.manifests)
+        total -= manifest.size
+        for digest in manifest.blobs:
+            references[digest] -= 1
+            if not references[digest]:
+                del references[digest]
+                total -= blobs.get(digest, 0)
+    for digest in blobs.keys() - references.keys():
+        os.unlink(digest, dir_fd=store.blobs)
+    os.fsync(store.manifests)
+    os.fsync(store.blobs)
 
 
-@_locked
 def save(checkpoint_id: str, store_limit: int = STORE_LIMIT, max_age_seconds: float = MAX_AGE_SECONDS):
+    """Record the namespace as checkpoint_id. Without storage, which restore reports, only the ID is kept."""
+    global _held
     if not isinstance(checkpoint_id, str) or not _UUID.fullmatch(checkpoint_id):
         raise ValueError("invalid checkpoint id")
+    _held = checkpoint_id
+    if _directory is None:
+        return
     began = time.monotonic()
-    root = _root()
-    saved, skipped, total = [], {}, 0
-    for name, value in list(_shell.user_ns.items()):
-        if not _eligible(name):
-            continue
-        try:
-            if isinstance(value, types.ModuleType):
-                saved.append({"name": name, "kind": "module", "module": value.__name__})
+    with _store() as store:
+        saved, skipped, total = [], {}, 0
+        for name, value in list(_shell.user_ns.items()):
+            if not _eligible(name):
                 continue
-            if _estimate(value) > VALUE_LIMIT:
-                raise ValueError("value exceeds 64 MB (size estimate)")
-            buffer = io.BytesIO()
-            writer = LimitedWriter(buffer, VALUE_LIMIT, "value exceeds 64 MB")
-            StatePickler(writer, protocol=5).dump(value)
-            if total + writer.size > TOTAL_LIMIT:
-                raise ValueError("checkpoint full")
-            data = buffer.getbuffer()
-            digest = hashlib.sha256(data).hexdigest()
-            blob = root / "blobs" / digest
-            if os.path.lexists(blob):
-                _check(blob)
-            else:
-                _atomic_write(blob, data)
-            total += writer.size
-            saved.append({"name": name, "kind": "value", "blob": digest, "bytes": writer.size})
-        except Exception as error:
-            skipped[name] = f"{type(error).__name__}: {str(error)[:300]}"
-    manifest = {
-        "version": 2,
-        "cell": max(0, _shell.execution_count - 1),
-        "saved": saved,
-        "skipped": skipped,
-        "bytes": total,
-        "duration": time.monotonic() - began,
-    }
-    manifest_path = root / "manifests" / f"{checkpoint_id}.json"
-    if os.path.lexists(manifest_path):
-        _check(manifest_path)
-    _atomic_write(manifest_path, json.dumps(manifest, separators=(",", ":")).encode())
-    _cleanup(root, checkpoint_id, max(0, int(store_limit)), max(0, float(max_age_seconds)))
-    return {"duration": time.monotonic() - began, "skipped": skipped}
+            try:
+                if isinstance(value, types.ModuleType):
+                    saved.append({"name": name, "kind": "module", "module": value.__name__})
+                    continue
+                if _estimate(value) > VALUE_LIMIT:
+                    raise ValueError("value exceeds 64 MB (size estimate)")
+                buffer = io.BytesIO()
+                writer = LimitedWriter(buffer, VALUE_LIMIT, "value exceeds 64 MB")
+                StatePickler(writer, protocol=5).dump(value)
+                if total + writer.size > TOTAL_LIMIT:
+                    raise ValueError("checkpoint full")
+                data = buffer.getbuffer()
+                digest = hashlib.sha256(data).hexdigest()
+                try:
+                    os.close(_open(store.blobs, digest, os.O_RDONLY))
+                except FileNotFoundError:
+                    _atomic_write(store.blobs, digest, data)
+                total += writer.size
+                saved.append({"name": name, "kind": "value", "blob": digest, "bytes": writer.size})
+            except Exception as error:
+                skipped[name] = f"{type(error).__name__}: {str(error)[:300]}"
+        manifest = {
+            "version": 2,
+            "cell": max(0, _shell.execution_count - 1),
+            "saved": saved,
+            "skipped": skipped,
+            "bytes": total,
+            "duration": time.monotonic() - began,
+        }
+        _atomic_write(store.manifests, f"{checkpoint_id}.json", json.dumps(manifest, separators=(",", ":")).encode())
+        _cleanup(store, checkpoint_id, max(0, int(store_limit)), max(0, float(max_age_seconds)))
+
+
+def accept(checkpoint_id: str | None):
+    """Treat the namespace as checkpoint_id after a restore that did not finish."""
+    global _held
+    _held = checkpoint_id
 
 
 def _clear():
@@ -339,53 +354,87 @@ def _clear():
             _shell.user_ns.pop(name, None)
 
 
-@_locked
+def _take_crashed(store: _Store):
+    """Delete and return the blob whose unpickling killed the previous kernel, if any."""
+    try:
+        data, _ = _read(store.root, _LOADING, 64)
+    except FileNotFoundError:
+        return None
+    os.unlink(_LOADING, dir_fd=store.root)
+    digest = data.decode("ascii", "replace")
+    if not _BLOB.fullmatch(digest):
+        return None
+    with contextlib.suppress(FileNotFoundError):
+        os.unlink(digest, dir_fd=store.blobs)
+    return digest
+
+
+def _load(store: _Store, digest: str):
+    data, _ = _read(store.blobs, digest, VALUE_LIMIT)
+    # The marker outlives this call only if unpickling kills the kernel.
+    with os.fdopen(_open(store.root, _LOADING, os.O_WRONLY | os.O_CREAT | os.O_TRUNC), "wb") as file:
+        file.write(digest.encode())
+    try:
+        return cloudpickle.loads(data)
+    finally:
+        os.unlink(_LOADING, dir_fd=store.root)
+
+
 def restore(candidate_ids):
+    """Replace the namespace with the newest readable checkpoint in candidate_ids (newest first).
+
+    Returns None when the namespace already holds candidate_ids[0], or when unavailable
+    storage was already reported. Unpickling runs user __setstate__ code under the
+    store-wide lock, so a slow value blocks other sessions until the restore is interrupted.
+    """
+    global _held, _storage_error_reported
     if not isinstance(candidate_ids, list):
         raise ValueError("checkpoint candidates must be a list")
+    nearest = candidate_ids[0] if candidate_ids else None
+    if _directory is None:
+        if _storage_error_reported:
+            return None
+        _storage_error_reported = True
+        return {"status": "unavailable", "error": _storage_error or "not initialized"}
+    if nearest == _held:
+        return None
     candidates = [value for value in candidate_ids if isinstance(value, str) and _UUID.fullmatch(value)]
-    selected = None
-    for checkpoint_id in candidates:
-        try:
-            selected = (checkpoint_id, *_read_manifest(checkpoint_id))
-            break
-        except (OSError, ValueError, json.JSONDecodeError, KeyError, TypeError):
-            continue
-    _clear()
-    if selected is None:
-        return {"id": None, "cell": None, "restored": [], "skipped": {},
-                "fellBack": bool(candidate_ids)}
+    with _store() as store:
+        crashed = _take_crashed(store)
+        selected = None
+        for checkpoint_id in candidates:
+            with contextlib.suppress(OSError, ValueError):
+                selected = checkpoint_id, _read_manifest(store, checkpoint_id)
+                break
+        _held = _PARTIAL
+        _clear()
+        if selected is None:
+            _held = nearest
+            return {"status": "empty", "fellBack": bool(candidate_ids)}
 
-    checkpoint_id, manifest_path, manifest = selected
-    os.utime(manifest_path, None, follow_symlinks=False)
-    summary = {
-        "id": checkpoint_id,
-        "cell": manifest["cell"],
-        "restored": [],
-        "skipped": dict(manifest["skipped"]),
-        "fellBack": not candidate_ids or checkpoint_id != candidate_ids[0],
-    }
-    entries = sorted(manifest["saved"], key=lambda item: item.get("kind") != "module")
-    for entry in entries:
-        name = entry.get("name")
-        if not isinstance(name, str) or not _eligible(name):
-            continue
-        try:
-            if entry.get("kind") == "module":
-                module = entry.get("module")
-                if not isinstance(module, str):
-                    raise ValueError("invalid module entry")
-                value = importlib.import_module(module)
-            elif entry.get("kind") == "value":
-                digest = entry.get("blob")
-                if not isinstance(digest, str) or not _BLOB.fullmatch(digest):
-                    raise ValueError("invalid blob id")
-                data = _read(_root() / "blobs" / digest, VALUE_LIMIT)
-                value = cloudpickle.loads(data)
-            else:
-                raise ValueError("invalid checkpoint entry")
-            _shell.user_ns[name] = value
-            summary["restored"].append(name)
-        except Exception as error:
-            summary["skipped"][name] = f"restore failed: {type(error).__name__}: {str(error)[:300]}"
-    return summary
+        checkpoint_id, manifest = selected
+        os.utime(f"{checkpoint_id}.json", dir_fd=store.manifests, follow_symlinks=False)
+        restored, skipped = [], dict(manifest.skipped)
+        for entry in sorted(manifest.entries, key=lambda entry: entry.module is None):
+            if not _eligible(entry.name):
+                continue
+            try:
+                if entry.module is not None:
+                    value = importlib.import_module(entry.module)
+                elif entry.blob == crashed:
+                    raise RuntimeError("restoring this value killed the kernel; it was deleted")
+                else:
+                    value = _load(store, entry.blob)
+                _shell.user_ns[entry.name] = value
+                restored.append(entry.name)
+            except Exception as error:
+                skipped[entry.name] = f"restore failed: {type(error).__name__}: {str(error)[:300]}"
+        _held = nearest
+        return {
+            "status": "restored",
+            "id": checkpoint_id,
+            "cell": manifest.cell,
+            "restored": restored,
+            "skipped": skipped,
+            "fellBack": checkpoint_id != nearest,
+        }

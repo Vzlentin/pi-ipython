@@ -1,4 +1,3 @@
-import { mkdirSync, realpathSync } from "node:fs";
 import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -12,8 +11,14 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { CellsView } from "./cells.ts";
-import { INTERRUPT_GRACE_MS, KernelRuntime, OUTPUT_CAPTURE_LIMIT_BYTES } from "./kernel-runtime.ts";
-import { cacheBase, Checkpoints, persistenceEnabled } from "./persistence.ts";
+import { describeError, INTERRUPT_GRACE_MS, KernelRuntime, OUTPUT_CAPTURE_LIMIT_BYTES } from "./kernel-runtime.ts";
+import { createRuntime } from "./persistence.ts";
+
+const RESET_NOTICE = [
+	"<ipython_kernel_reset>",
+	"The IPython kernel was restarted. All in-memory variables, imports, tasks, and open resources from the previous kernel were lost; recreate them before continuing.",
+	"</ipython_kernel_reset>",
+].join("\n");
 
 const DESCRIPTION = [
 	"Execute Python in a persistent IPython kernel. Reuse variables, functions, datasets, and intermediate results across calls. Supports top-level await and native IPython magics. Checkpointed state follows the conversation branch; reloads and crashes restore the latest saved cell on that branch. Live resources, process state, and files are not rewound. The kernel runs with local user permissions, including filesystem and network access; it is not sandboxed.",
@@ -34,7 +39,6 @@ interface IpythonDetails {
 	truncated?: boolean;
 	fullOutputPath?: string;
 	checkpoint?: string;
-	checkpointSaveMs?: number;
 }
 
 function stripAnsi(value: string): string {
@@ -82,40 +86,21 @@ async function finalText(output: string): Promise<{
 }
 
 export default function ipythonExtension(pi: ExtensionAPI) {
-	let runtime: { kernel: KernelRuntime; checkpoints?: Checkpoints } | undefined;
+	let runtime: ReturnType<typeof createRuntime> | undefined;
+	// Checkpoint notices from opening the console, delivered with the next result.
+	let undelivered: string[] = [];
 	const cells = new CellsView(pi);
-	const getRuntime = (ctx: ExtensionContext) => {
-		if (runtime) return runtime;
-		const kernel = new KernelRuntime(pi);
-		if (!persistenceEnabled(ctx.cwd)) return runtime = { kernel };
-		const base = cacheBase();
-		mkdirSync(base, { recursive: true });
-		return runtime = { kernel, checkpoints: new Checkpoints(kernel, realpathSync(base)) };
-	};
-	const synchronize = async (
-		state: { kernel: KernelRuntime; checkpoints?: Checkpoints }, ctx: ExtensionContext,
-		onProgress: (message: string) => void, signal = ctx.signal,
-	) => {
-		await state.kernel.start(ctx.cwd, signal, onProgress);
-		if (!state.checkpoints) return;
-		await state.checkpoints.sync(ctx.sessionManager.getBranch(), signal);
-		// A timed-out save or restore may have killed the kernel. Start and sync its new generation once.
-		const generation = state.kernel.generation;
-		await state.kernel.start(ctx.cwd, signal, onProgress);
-		if (state.kernel.generation !== generation) {
-			await state.checkpoints.sync(ctx.sessionManager.getBranch(), signal);
-		}
-	};
+	const getRuntime = (ctx: ExtensionContext) => runtime ??= createRuntime(pi, ctx.cwd);
 	const toggleCells = async (ctx: ExtensionContext) => {
 		if (ctx.mode !== "tui" || process.env.HERDR_ENV !== "1") {
 			ctx.ui.notify("/cells requires interactive Pi in Herdr.", "warning");
 			return;
 		}
 		try {
-			const state = getRuntime(ctx);
+			const { kernel, checkpoints } = getRuntime(ctx);
 			const progress = (message: string) => ctx.ui.notify(message, "info");
-			await synchronize(state, ctx, progress);
-			const connectionFile = await state.kernel.getConnectionFile(ctx.cwd, ctx.signal, progress);
+			undelivered.push(...await checkpoints.sync(ctx.sessionManager.getBranch(), ctx.cwd, ctx.signal, progress));
+			const connectionFile = await kernel.getConnectionFile(ctx.cwd, ctx.signal, progress);
 			await cells.toggle(ctx.cwd, connectionFile);
 		} catch (error) {
 			ctx.ui.notify(String(error), "error");
@@ -138,8 +123,7 @@ export default function ipythonExtension(pi: ExtensionAPI) {
 		parameters,
 		executionMode: "sequential",
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
-			const state = getRuntime(ctx);
-			const kernel = state.kernel;
+			const { kernel, checkpoints } = getRuntime(ctx);
 			const transcript = ctx.mode === "tui" && process.env.HERDR_ENV === "1" ? cells : undefined;
 			transcript?.begin(params.code);
 			let latestOutput = "";
@@ -176,8 +160,9 @@ export default function ipythonExtension(pi: ExtensionAPI) {
 			};
 
 			let execution: Awaited<ReturnType<KernelRuntime["execute"]>>;
+			let notices: string[];
 			try {
-				await synchronize(state, ctx, progress, signal);
+				notices = await checkpoints.sync(ctx.sessionManager.getBranch(), ctx.cwd, signal, progress);
 				execution = await kernel.execute(toolCallId, params.code, ctx.cwd, signal, progress, output);
 			} catch (error) {
 				transcript?.finish(`error: ${String(error)}`);
@@ -185,12 +170,13 @@ export default function ipythonExtension(pi: ExtensionAPI) {
 			} finally {
 				if (updateTimer) clearTimeout(updateTimer);
 			}
-			const { result, kernelReset, notice } = execution;
+			const { result, kernelReset } = execution;
+			const notice = [kernelReset ? RESET_NOTICE : undefined, ...undelivered, ...notices]
+				.filter(Boolean).join("\n\n");
+			undelivered = [];
 			transcript?.output(result.output);
 			if (notice) transcript?.note(notice);
-			if (result.status !== "ok" && !result.output) {
-				transcript?.note([result.error?.ename, result.error?.evalue].filter(Boolean).join(": "));
-			}
+			if (result.status !== "ok" && !result.output) transcript?.note(describeError(result.error));
 			transcript?.finish(`${result.status}${result.executionCount === undefined ? "" : ` | In [${result.executionCount}]`}`);
 			const formatted = await finalText(result.output);
 			let visible = formatted.text;
@@ -198,18 +184,16 @@ export default function ipythonExtension(pi: ExtensionAPI) {
 				visible = formatted.text === "[no output]" ? notice : `${notice}\n\n${formatted.text}`;
 			}
 			if (result.status !== "ok") {
-				const fallback = [result.error?.ename, result.error?.evalue].filter(Boolean).join(": ");
+				const fallback = describeError(result.error);
 				if (visible === "[no output]" && fallback) visible = fallback;
 			}
-			const checkpoint = state.checkpoints?.save();
 			const details: IpythonDetails = {
 				status: result.status === "ok" ? "ok" : "error",
 				executionCount: result.executionCount,
 				kernelReset,
 				truncated: formatted.truncated,
 				fullOutputPath: formatted.fullOutputPath,
-				...(checkpoint ? { checkpoint: checkpoint.id } : {}),
-				...(checkpoint?.previousSaveMs === undefined ? {} : { checkpointSaveMs: checkpoint.previousSaveMs }),
+				checkpoint: checkpoints.save(),
 			};
 			return { content: [{ type: "text", text: visible }], details };
 		},
@@ -226,7 +210,7 @@ export default function ipythonExtension(pi: ExtensionAPI) {
 		const closing = runtime;
 		runtime = undefined;
 		try {
-			await closing?.checkpoints?.close();
+			await closing?.checkpoints.close();
 		} finally {
 			await closing?.kernel.shutdown();
 			await cells.shutdown();

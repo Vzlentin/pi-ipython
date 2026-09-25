@@ -62,7 +62,6 @@ print('saved')`);
 	assert.equal(restored.details.executionCount, 1);
 	const rebound = await extension.cell("value = 100\nprint(f(), box.answer(), closure(), next(iter(functions))(), partial())");
 	assert.match(rebound.text, /100 101 102 100 100/);
-	assert.equal(typeof rebound.details.checkpointSaveMs, "number");
 
 	// Store ownership and modes are externally visible security guarantees.
 	await extension.shutdown("reload");
@@ -121,8 +120,10 @@ print('saved')`);
 		assert.equal(existsSync(join(gcRoot, "blobs", sharedBlob)), true);
 		assert.equal(readdirSync(join(gcRoot, "blobs")).length, 2);
 		await runKernel(kernel, "del shared, only_new", root);
-		const summary = await kernel.evaluate(`__import__('pi_ipython_state').restore([${JSON.stringify(newId)}])`);
+		// The kernel already holds newId, so name a missing newer checkpoint to force a restore.
+		const summary = await kernel.evaluate(`__import__('pi_ipython_state').restore(${JSON.stringify([randomUUID(), newId])})`);
 		assert.equal(summary.id, newId);
+		assert.equal(summary.fellBack, true);
 		assert.equal((await runKernel(kernel, "print(len(shared), len(only_new))", root)).result.output.trim(), "1048576 1048576");
 	} finally {
 		await kernel.shutdown();
@@ -194,7 +195,7 @@ print('saved')`);
 	const offManager = SessionManager.inMemory(offRoot);
 	let off = createExtensionHarness({ root: offRoot, sessionManager: offManager });
 	const offCell = await off.cell("off_value = 12");
-	assert.equal(Object.hasOwn(offCell.details, "checkpoint"), false);
+	assert.equal(offCell.details.checkpoint, undefined);
 	await off.shutdown("reload");
 	off = createExtensionHarness({ root: offRoot, sessionManager: offManager });
 	assert.equal((await off.cell("print('off_value' in globals())")).text.trim(), "False");
@@ -209,8 +210,17 @@ print('saved')`);
 	process.env.XDG_CACHE_HOME = join(configRoot, "cache");
 	const configManager = SessionManager.inMemory(configRoot);
 	const configOff = createExtensionHarness({ root: configRoot, sessionManager: configManager });
-	assert.equal(Object.hasOwn((await configOff.cell("value = 1")).details, "checkpoint"), false);
+	assert.equal((await configOff.cell("value = 1")).details.checkpoint, undefined);
 	await configOff.shutdown();
+
+	// A malformed project configuration names the file instead of throwing a bare SyntaxError.
+	const brokenRoot = join(root, "config-broken");
+	mkdirSync(join(brokenRoot, ".git"), { recursive: true });
+	mkdirSync(join(brokenRoot, ".pi"));
+	writeFileSync(join(brokenRoot, ".pi", "pi-ipython.json"), "{persistence:");
+	const brokenConfig = createExtensionHarness({ root: brokenRoot, sessionManager: SessionManager.inMemory(brokenRoot) });
+	await assert.rejects(brokenConfig.cell("pass"), /Invalid IPython configuration .*pi-ipython\.json/);
+	await brokenConfig.shutdown();
 } finally {
 	await extension.shutdown().catch(() => {});
 	rmSync(root, { recursive: true, force: true });

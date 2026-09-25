@@ -35,14 +35,13 @@ export async function waitFor(condition, timeout = 10_000) {
 	}
 }
 
-export function createKernel(startup) {
+export function createKernel(startup, startupCode) {
 	const bus = new EventEmitter();
 	if (startup) bus.on("ipython:kernel-starting", startup);
-	const kernel = new KernelRuntime({
+	return new KernelRuntime({
 		events: { emit: (name, data) => bus.emit(name, data) },
 		exec: execShim,
-	});
-	return kernel;
+	}, startupCode);
 }
 
 export function runKernel(kernel, code, cwd, options = {}) {
@@ -68,7 +67,6 @@ export function createExtensionHarness({ root, sessionManager, startup } = {}) {
 	ipythonExtension({
 		events: { emit: (name, data) => bus.emit(name, data) },
 		on(name, handler) { handlers.set(name, handler); },
-		appendEntry(name, data) { return sessionManager.appendCustomEntry(name, data); },
 		registerTool(definition) { tool = definition; },
 		registerCommand() {},
 		registerShortcut() {},
@@ -76,7 +74,6 @@ export function createExtensionHarness({ root, sessionManager, startup } = {}) {
 	});
 	return {
 		ctx,
-		fire(name, event = {}) { return handlers.get(name)?.(event, ctx); },
 		async cell(code, { signal } = {}) {
 			const toolCallId = `tool-${++toolIndex}`;
 			const result = await tool.execute(toolCallId, { code }, signal, () => {}, ctx);
@@ -102,6 +99,5 @@ export function createExtensionHarness({ root, sessionManager, startup } = {}) {
 export function copyBranch(source, target) {
 	for (const entry of source.getBranch()) {
 		if (entry.type === "message") target.appendMessage(structuredClone(entry.message));
-		else if (entry.type === "custom") target.appendCustomEntry(entry.customType, structuredClone(entry.data));
 	}
 }
