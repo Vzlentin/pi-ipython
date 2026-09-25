@@ -52,6 +52,10 @@ History is plain text, recorded from the first tool call after loading the exten
 
 **The console is interactive, not read-only.** Code entered there changes the same kernel state as Pi. Do not run code there while Pi is working.
 
+## Interruption
+
+Cancellation and output overflow first send SIGINT to the kernel process group. If the cell stops within 3 seconds, its partial output is returned as an error and kernel state is preserved. Otherwise the kernel and associated child work are killed. Top-level `await` is supported, including a signal-wakeup workaround for ipykernel 7.
+
 ## Security
 
 The kernel is not sandboxed. Code runs with your user permissions and can access local files, environment variables, and the network. The separate Python runtime isolates dependencies, not system access.
@@ -62,8 +66,7 @@ The kernel is not sandboxed. Code runs with your user permissions and can access
 npm test
 ```
 
-Model-free: typechecking, and real kernels for state, working directory, reset,
-cleanup, the startup hook, and the Herdr console. See [tests/README.md](tests/README.md).
+Model-free: typechecking and real kernels for state, working directory, synchronous and asynchronous interruption, overflow capture, reset cleanup, the startup hook, and the Herdr console. See [tests/README.md](tests/README.md).
 
 ## License
 

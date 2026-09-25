@@ -20,6 +20,7 @@ const PROVISION_LOCK = join(EXTENSION_DIR, ".python.lock");
 const STARTUP_TIMEOUT_MS = 45_000;
 const PROVISION_TIMEOUT_MS = 6 * 60_000;
 export const OUTPUT_CAPTURE_LIMIT_BYTES = 1024 * 1024;
+export const INTERRUPT_GRACE_MS = 3_000;
 export const BRIDGE_PROTOCOL_VERSION = 1;
 export const KERNEL_STARTING_EVENT = "ipython:kernel-starting";
 
@@ -49,6 +50,7 @@ interface ActiveExecution {
 	onOutput?: (output: string) => void;
 	resolve: (result: BridgeResult) => void;
 	reject: (error: Error) => void;
+	interrupt?: { reason: string; timer: ReturnType<typeof setTimeout>; overflow: boolean };
 }
 
 interface ReadyWaiter {
@@ -108,6 +110,7 @@ export class KernelRuntime {
 	): Promise<{ result: BridgeResult; kernelReset: boolean }> {
 		if (this.disposed) throw new Error("IPython runtime is shutting down");
 		const operationSignal = signal ? AbortSignal.any([signal, this.lifecycle.signal]) : this.lifecycle.signal;
+		if (operationSignal.aborted) throw new Error("IPython execution cancelled before it started");
 		await this.ensureStarted(cwd, operationSignal, onProgress);
 		if (!this.child || !this.ready) throw new Error("IPython kernel did not start");
 		if (this.active) throw new Error("IPython kernel is already executing a cell");
@@ -128,20 +131,13 @@ export class KernelRuntime {
 
 			const abort = () => {
 				if (this.active !== active) return;
-				this.active = undefined;
-				this.pendingResetNotice = true;
-				void this.terminate().finally(() => {
-					reject(
-						new Error(
-							"IPython execution cancelled. Associated child work was aborted and the kernel was killed, so all in-memory state was lost; the next call will start a fresh kernel.",
-						),
-					);
-				});
+				this.interrupt(active, "IPython execution cancelled");
 			};
 			operationSignal.addEventListener("abort", abort, { once: true });
 
 			const settle = (callback: () => void) => {
 				operationSignal.removeEventListener("abort", abort);
+				clearTimeout(active.interrupt?.timer);
 				callback();
 			};
 			active.resolve = (value) => settle(() => resolve(value));
@@ -252,6 +248,10 @@ export class KernelRuntime {
 		};
 		this.pi.events.emit(KERNEL_STARTING_EVENT, starting);
 		await Promise.all(waits);
+		starting.startupCode.push(
+			`__import__('sys').path.insert(0, ${JSON.stringify(join(EXTENSION_DIR, "kernel"))})`,
+			"__import__('pi_ipython_interrupt').install(get_ipython().kernel)",
+		);
 		if (signal?.aborted) throw new Error("IPython startup cancelled");
 		onProgress("Starting IPython kernel...");
 
@@ -374,6 +374,7 @@ export class KernelRuntime {
 			return;
 		}
 		if (message.type === "output" && typeof message.text === "string") {
+			if (active.interrupt?.overflow) return;
 			const kind = String(message.kind ?? "stdout");
 			if (kind === "stdout" || kind === "stderr") {
 				active.output += message.text;
@@ -392,14 +393,7 @@ export class KernelRuntime {
 				} catch (error) {
 					captureNotice = `Could not save captured output: ${errorText(error)}`;
 				}
-				this.active = undefined;
-				this.pendingResetNotice = true;
-				active.reject(
-					new Error(
-						`IPython output exceeded ${formatSize(OUTPUT_CAPTURE_LIMIT_BYTES)}. The runaway cell was stopped and kernel state was lost. ${captureNotice}\n\n${partialOutput(active.output)}`,
-					),
-				);
-				this.kill();
+				this.interrupt(active, `IPython output exceeded ${formatSize(OUTPUT_CAPTURE_LIMIT_BYTES)}. ${captureNotice}`, true);
 				return;
 			}
 			active.onOutput?.(active.output);
@@ -415,13 +409,30 @@ export class KernelRuntime {
 		}
 		if (message.type === "result") {
 			this.active = undefined;
+			const interrupted = active.interrupt?.reason;
 			active.resolve({
-				status: String(message.status ?? "error"),
+				status: interrupted ? "error" : String(message.status ?? "error"),
 				executionCount: typeof message.execution_count === "number" ? message.execution_count : undefined,
-				error: message.error,
-				output: active.output,
+				error: interrupted ? { ename: "Interrupted", evalue: interrupted } : message.error,
+				output: interrupted
+					? `${interrupted}; interrupted, kernel state preserved.\n\n${active.output}`
+					: active.output,
 			});
 		}
+	}
+
+	private interrupt(active: ActiveExecution, reason: string, overflow = false): void {
+		if (active.interrupt) return;
+		const timer = setTimeout(() => {
+			if (this.active !== active) return;
+			this.active = undefined;
+			this.pendingResetNotice = true;
+			void this.terminate().finally(() => active.reject(new Error(
+				`${reason}. The cell did not stop within ${INTERRUPT_GRACE_MS / 1000}s; the kernel was killed and in-memory state was lost.\n\n${partialOutput(active.output)}`,
+			)));
+		}, INTERRUPT_GRACE_MS);
+		active.interrupt = { reason, timer, overflow };
+		this.signalProcessGroup(this.kernelPgid, "SIGINT");
 	}
 
 	private handleStdinError(child: ChildProcessWithoutNullStreams | undefined, error: unknown): void {

@@ -11,7 +11,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { CellsView } from "./cells.ts";
-import { KernelRuntime, OUTPUT_CAPTURE_LIMIT_BYTES } from "./kernel-runtime.ts";
+import { INTERRUPT_GRACE_MS, KernelRuntime, OUTPUT_CAPTURE_LIMIT_BYTES } from "./kernel-runtime.ts";
 
 const RESET_NOTICE = [
 	"<ipython_kernel_reset>",
@@ -24,7 +24,7 @@ const DESCRIPTION = [
 	"ipython is your persistent control environment, not the native runtime of the project. Run project code, tests, and CLIs through the project's own interface (documented commands, `uv run ...`, `.venv/bin/python ...`) and treat their result as the relevant result. Do not install project dependencies into the kernel.",
 	"Kernel state persists across cells, not resets or reloads. Keep reusable functions, datasets, read/search results, and intermediate computations in named variables. Save valuable results to explicit artifacts for recovery.",
 	"Use Python for loops, parsing, and state. Use the shell only to invoke programs.",
-	`Output is truncated to ${DEFAULT_MAX_LINES} lines or ${formatSize(DEFAULT_MAX_BYTES)}; full truncated output is saved to a temporary file. Runaway cells exceeding ${formatSize(OUTPUT_CAPTURE_LIMIT_BYTES)} of output are stopped and reset the kernel.`,
+	`Output is truncated to ${DEFAULT_MAX_LINES} lines or ${formatSize(DEFAULT_MAX_BYTES)}; full truncated output is saved to a temporary file. Runaway cells exceeding ${formatSize(OUTPUT_CAPTURE_LIMIT_BYTES)} of output are interrupted; the kernel is killed only if it does not stop within ${INTERRUPT_GRACE_MS / 1000} seconds.`,
 ].join("\n\n");
 
 const parameters = Type.Object({

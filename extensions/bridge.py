@@ -124,7 +124,7 @@ def wait_for_execution(
             pass
 
         try:
-            message = client.get_shell_msg(timeout=0.05)
+            message = client.get_shell_msg(timeout=0)
             received = True
             if (
                 parent_id(message) == msg_id

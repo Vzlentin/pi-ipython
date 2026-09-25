@@ -307,9 +307,8 @@ if (process.argv.includes("--kernel")) {
 		const first = await kernel.getConnectionFile(config.cwd, undefined, () => {});
 		assert.equal(existsSync(first), true);
 		await view.toggle(config.cwd, first);
-		const abort = new AbortController();
-		await assert.rejects(kernel.execute("cancel", "import asyncio\nprint('ready', flush=True)\nawait asyncio.sleep(60)",
-			config.cwd, abort.signal, () => {}, (text) => { if (text.includes("ready")) abort.abort(); }), /cancelled/);
+		await assert.rejects(kernel.execute("crash", "import os; os._exit(1)",
+			config.cwd, undefined, () => {}, () => {}), /kernel state was lost/);
 		recoveredConnection = await kernel.getConnectionFile(config.cwd, undefined, () => {});
 		assert.notEqual(recoveredConnection, first);
 		assert.equal(existsSync(first), false);

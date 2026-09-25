@@ -55,11 +55,26 @@ try {
 
 	const oldPgid = await pgidOf(plain, first);
 	const abort = new AbortController();
+	for (const code of ["import asyncio\nawait asyncio.sleep(60)", "import time\ntime.sleep(60)"]) {
+		const controller = new AbortController();
+		const interrupted = await plain.execute("cancel", `print('ready', flush=True)\n${code}`, first, controller.signal,
+			() => {}, (text) => { if (text.includes("ready")) controller.abort(); });
+		assert.equal(interrupted.result.status, "error");
+		assert.match(interrupted.result.output, /interrupted, kernel state preserved/);
+		assert.match(interrupted.result.output, /ready/);
+		assert.equal(alive(oldPgid), true);
+		assert.equal((await run(plain, "kept", "print(value)", first)).result.output.trim(), "41");
+	}
+	const overflow = await run(plain, "overflow", "while True: print('x' * 10000, flush=True)", first);
+	assert.equal(overflow.result.status, "error");
+	assert.match(overflow.result.output, /Captured output saved to:/);
+	assert.match(overflow.result.output, /kernel state preserved/);
+	assert.equal((await run(plain, "kept", "print(value)", first)).result.output.trim(), "41");
+	const began = Date.now();
 	await assert.rejects(
-		plain.execute("cancel", "import asyncio\nprint('ready', flush=True)\nawait asyncio.sleep(60)", first, abort.signal,
-			() => {}, (text) => { if (text.includes("ready")) abort.abort(); }),
-		/cancelled/,
-	);
+		plain.execute("ignore", "import signal, time\nsignal.signal(signal.SIGINT, signal.SIG_IGN)\nprint('ready', flush=True)\ntime.sleep(60)", first, abort.signal,
+			() => {}, (text) => { if (text.includes("ready")) abort.abort(); }), /did not stop within 3s/);
+	assert.ok(Date.now() - began >= 3000);
 	assert.equal(alive(oldPgid), false);
 	const reset = await run(plain, "reset", "print('value' in globals())", first);
 	assert.equal(reset.kernelReset, true);
@@ -84,12 +99,7 @@ try {
 	const seen = await run(hooked, "hook", "import os\nprint(hook_value, os.environ['PI_IPYTHON_HOOK'])", first);
 	assert.equal(seen.result.output.trim(), "1 env-1");
 	assert.equal(process.env.PI_IPYTHON_HOOK, undefined);
-	const abort = new AbortController();
-	await assert.rejects(
-		hooked.execute("cancel", "import asyncio\nprint('ready', flush=True)\nawait asyncio.sleep(60)", first, abort.signal,
-			() => {}, (text) => { if (text.includes("ready")) abort.abort(); }),
-		/cancelled/,
-	);
+	await assert.rejects(run(hooked, "crash", "os._exit(1)", first), /kernel state was lost/);
 	const again = await run(hooked, "again", "import os\nprint(hook_value, os.environ['PI_IPYTHON_HOOK'])", first);
 	assert.equal(again.kernelReset, true);
 	assert.equal(again.result.output.trim(), "2 env-2");
