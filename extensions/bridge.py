@@ -3,13 +3,14 @@
 
 Protocol (JSON lines). The first stdin line is {"type": "startup", "code": [...]};
 each snippet runs hidden after the kernel is ready, then "ready" is sent.
-Later lines are {"type": "execute", "request_id", "code", "cwd"} or
-{"type": "shutdown"}. Output streams as "output"/"clear" messages; each cell
-ends with "result" (status, execution_count, error).
+Later lines are {"type": "execute", "request_id", "code", "cwd"},
+{"type": "evaluate", "request_id", "expression"}, or {"type": "shutdown"}.
+Output streams as "output"/"clear" messages; requests end with "result".
 """
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import queue
@@ -24,7 +25,7 @@ from typing import Any
 
 from jupyter_client import KernelManager
 
-BRIDGE_PROTOCOL_VERSION = 1
+BRIDGE_PROTOCOL_VERSION = 2
 _OUTPUT_MESSAGE_CHARS = 16_384
 _SEND_LOCK = threading.Lock()
 
@@ -151,6 +152,29 @@ def execute_hidden(client: Any, manager: KernelManager, code: str) -> None:
         raise RuntimeError(f"{name}: {value}".rstrip())
 
 
+def evaluate(client: Any, manager: KernelManager, request_id: str, expression: str) -> None:
+    msg_id = client.execute(
+        "", silent=True, store_history=False, allow_stdin=False, stop_on_error=True,
+        user_expressions={"value": f"__import__('json').dumps({expression})"},
+    )
+    content = wait_for_execution(client, manager, msg_id).get("content", {})
+    result = content.get("user_expressions", {}).get("value", {})
+    if content.get("status") == "ok" and result.get("status") == "ok":
+        value = json.loads(ast.literal_eval(result["data"]["text/plain"]))
+        send({"type": "result", "request_id": request_id, "status": "ok", "value": value})
+        return
+    error = result if result.get("status") == "error" else content
+    send({
+        "type": "result",
+        "request_id": request_id,
+        "status": "error",
+        "error": {
+            "ename": str(error.get("ename", "EvaluationError")),
+            "evalue": str(error.get("evalue", "")),
+        },
+    })
+
+
 def execute(client: Any, manager: KernelManager, request_id: str, code: str, cwd: str) -> None:
     # Out of band so a native cell magic remains on line 1.
     execute_hidden(client, manager, f"__import__('os').chdir({cwd!r})")
@@ -259,6 +283,12 @@ def main() -> int:
                     if not os.path.isabs(request_cwd) or not os.path.isdir(request_cwd):
                         raise ValueError("execute cwd must be an accessible absolute directory")
                     execute(client, manager, request_id, code, request_cwd)
+                elif msg_type == "evaluate":
+                    request_id = message.get("request_id")
+                    expression = message.get("expression")
+                    if not isinstance(request_id, str) or not isinstance(expression, str):
+                        raise ValueError("evaluate requires string request_id and expression")
+                    evaluate(client, manager, request_id, expression)
                 elif msg_type == "shutdown":
                     break
                 else:

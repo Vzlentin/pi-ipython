@@ -14,7 +14,8 @@
   "scripts": {
     "typecheck": "tsc -p tsconfig.json",
     "test:kernel": "node --no-warnings tests/test_kernel.mjs && node --no-warnings tests/test_cells.mjs --kernel",
-    "test": "npm run typecheck && npm run test:kernel"
+    "test:persistence": "node --no-warnings tests/test_persistence.mjs && node --no-warnings tests/test_branches.mjs && node --no-warnings tests/test_checkpoint_limits.mjs",
+    "test": "npm run typecheck && npm run test:kernel && npm run test:persistence"
   },
   "pi": {
     "extensions": [

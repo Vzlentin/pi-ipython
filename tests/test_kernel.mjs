@@ -1,26 +1,10 @@
 import assert from "node:assert/strict";
-import { execFile } from "node:child_process";
-import { EventEmitter } from "node:events";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { promisify } from "node:util";
-import { KERNEL_STARTING_EVENT, KernelRuntime } from "../extensions/kernel-runtime.ts";
+import { createKernel, runKernel } from "./helpers.mjs";
 
-const exec = promisify(execFile);
-const bus = new EventEmitter();
-const pi = {
-	events: { emit: (channel, data) => bus.emit(channel, data), on: (channel, handler) => bus.on(channel, handler) },
-	async exec(command, args, options) {
-		try {
-			return { ...await exec(command, args, options), code: 0 };
-		} catch (error) {
-			return { code: error.code ?? 1, stderr: error.stderr ?? error.message, stdout: error.stdout ?? "" };
-		}
-	},
-};
-
-const run = (kernel, id, code, cwd) => kernel.execute(id, code, cwd, undefined, () => {}, () => {});
+const run = (kernel, _id, code, cwd) => runKernel(kernel, code, cwd);
 const alive = (pgid) => {
 	try {
 		process.kill(-pgid, 0);
@@ -35,10 +19,11 @@ const pgidOf = async (kernel, cwd) =>
 const root = mkdtempSync(join(tmpdir(), "pi-ipython-kernel-"));
 const first = join(root, "first");
 const second = join(root, "second");
-await exec("mkdir", [first, second]);
+mkdirSync(first);
+mkdirSync(second);
 
 // With no listener, the kernel runs, keeps state, applies each cell's cwd, resets and cleans up.
-const plain = new KernelRuntime(pi);
+const plain = createKernel();
 let plainPgid;
 try {
 	const one = await run(plain, "one", "import os\nvalue = 41\nprint(os.getcwd())", first);
@@ -52,9 +37,15 @@ try {
 	assert.equal((await run(plain, "kept", "print(value)", second)).result.output.trim(), "41");
 	const hidden = await run(plain, "rlm", "print('rlm' in globals())", second);
 	assert.equal(hidden.result.output.trim(), "False");
+	assert.deepEqual(await plain.evaluate("{'answer': [41, 42]}"), { answer: [41, 42] });
+	await assert.rejects(plain.evaluate("(_ for _ in ()).throw(ValueError('evaluate fixture'))"), /evaluate fixture/);
+	await assert.rejects(
+		plain.evaluate("(__import__('time').sleep(60), None)[1]", { timeoutMs: 50 }),
+		/evaluation exceeded/,
+	);
+	assert.equal((await run(plain, "after-evaluate", "print(value)", first)).result.output.trim(), "41");
 
 	const oldPgid = await pgidOf(plain, first);
-	const abort = new AbortController();
 	for (const code of ["import asyncio\nawait asyncio.sleep(60)", "import time\ntime.sleep(60)"]) {
 		const controller = new AbortController();
 		const interrupted = await plain.execute("cancel", `print('ready', flush=True)\n${code}`, first, controller.signal,
@@ -70,14 +61,20 @@ try {
 	assert.match(overflow.result.output, /Captured output saved to:/);
 	assert.match(overflow.result.output, /kernel state preserved/);
 	assert.equal((await run(plain, "kept", "print(value)", first)).result.output.trim(), "41");
+	plain.notify("notice queued before reset");
+	const generation = plain.generation;
 	const began = Date.now();
 	await assert.rejects(
-		plain.execute("ignore", "import signal, time\nsignal.signal(signal.SIGINT, signal.SIG_IGN)\nprint('ready', flush=True)\ntime.sleep(60)", first, abort.signal,
-			() => {}, (text) => { if (text.includes("ready")) abort.abort(); }), /did not stop within 3s/);
+		plain.evaluate("(__import__('signal').signal(2, __import__('signal').SIG_IGN), __import__('time').sleep(60))[1]", { timeoutMs: 50 }),
+		/did not stop within 3s/,
+	);
 	assert.ok(Date.now() - began >= 3000);
 	assert.equal(alive(oldPgid), false);
 	const reset = await run(plain, "reset", "print('value' in globals())", first);
 	assert.equal(reset.kernelReset, true);
+	assert.match(reset.notice, /notice queued before reset/);
+	assert.match(reset.notice, /ipython_kernel_reset/);
+	assert.ok(plain.generation > generation);
 	assert.equal(reset.result.output.trim(), "False");
 	plainPgid = await pgidOf(plain, first);
 } finally {
@@ -87,14 +84,13 @@ assert.equal(alive(plainPgid), false);
 
 // A listener's environment and startup code reach every kernel start, after its promise settles.
 let starts = 0;
-bus.on(KERNEL_STARTING_EVENT, (event) => {
+const hooked = createKernel((event) => {
 	starts += 1;
 	event.startupCode.push(`hook_value = ${starts}`);
 	event.waitFor(new Promise((resolve) => setTimeout(resolve, 50)).then(() => {
 		event.env.PI_IPYTHON_HOOK = `env-${starts}`;
 	}));
 });
-const hooked = new KernelRuntime(pi);
 try {
 	const seen = await run(hooked, "hook", "import os\nprint(hook_value, os.environ['PI_IPYTHON_HOOK'])", first);
 	assert.equal(seen.result.output.trim(), "1 env-1");
@@ -108,9 +104,7 @@ try {
 }
 
 // A failing startup snippet fails the kernel start instead of running cells without it.
-bus.removeAllListeners(KERNEL_STARTING_EVENT);
-bus.on(KERNEL_STARTING_EVENT, (event) => event.startupCode.push("raise RuntimeError('startup fixture')"));
-const broken = new KernelRuntime(pi);
+const broken = createKernel((event) => event.startupCode.push("raise RuntimeError('startup fixture')"));
 try {
 	await assert.rejects(run(broken, "broken", "print(1)", first), /startup fixture/);
 } finally {

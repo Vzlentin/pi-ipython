@@ -216,6 +216,8 @@ let shortcut;
 const commands = new Map();
 const events = new Map();
 const notices = [];
+const originalPersistence = process.env.PI_IPYTHON_PERSISTENCE;
+process.env.PI_IPYTHON_PERSISTENCE = "0";
 ipythonExtension({
 	...pi,
 	registerTool(value) { tool = value; },
@@ -232,10 +234,12 @@ const ctx = {
 	ui: { setWidget() {}, notify(...args) { notices.push(args); } },
 };
 const execute = KernelRuntime.prototype.execute;
+const start = KernelRuntime.prototype.start;
 const getConnectionFile = KernelRuntime.prototype.getConnectionFile;
 let connectionRequests = 0;
 let executions = 0;
 try {
+	KernelRuntime.prototype.start = async () => {};
 	KernelRuntime.prototype.getConnectionFile = async () => { connectionRequests++; return firstConnection; };
 	KernelRuntime.prototype.execute = async (_id, _code, _cwd, _signal, progress, output) => {
 		executions++;
@@ -243,6 +247,7 @@ try {
 		output("streamed output\n");
 		return {
 			kernelReset: true,
+			notice: "<ipython_kernel_reset>\nreset fixture\n</ipython_kernel_reset>",
 			result: { status: "ok", executionCount: 1, output: "streamed output\n" },
 		};
 	};
@@ -280,8 +285,11 @@ try {
 	assert.equal(calls.length, before);
 } finally {
 	KernelRuntime.prototype.execute = execute;
+	KernelRuntime.prototype.start = start;
 	KernelRuntime.prototype.getConnectionFile = getConnectionFile;
 	await events.get("session_shutdown")();
+	if (originalPersistence === undefined) delete process.env.PI_IPYTHON_PERSISTENCE;
+	else process.env.PI_IPYTHON_PERSISTENCE = originalPersistence;
 	rmSync(connectionDirectory, { recursive: true, force: true });
 	if (originalHerdr === undefined) delete process.env.HERDR_ENV;
 	else process.env.HERDR_ENV = originalHerdr;
