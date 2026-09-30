@@ -73,6 +73,24 @@ export function createExtensionHarness({ root, sessionManager, startup } = {}) {
 		appendEntry(customType, data) { sessionManager.appendCustomEntry(customType, data); },
 		exec: execShim,
 	});
+	// Pi's merge of a tool_result hook's changes into the executed result.
+	const finalize = async (event, executed) => {
+		const hook = await handlers.get("tool_result")?.({
+			type: "tool_result",
+			...event,
+			content: executed.content,
+			details: executed.details,
+			structuredContent: executed.structuredContent,
+			isError: executed.isError === true,
+		}, ctx);
+		if (!hook) return executed;
+		return {
+			content: hook.content ?? executed.content,
+			details: hook.details ?? executed.details,
+			structuredContent: hook.structuredContent ?? (hook.content ? undefined : executed.structuredContent),
+			isError: hook.isError ?? executed.isError,
+		};
+	};
 	return {
 		ctx,
 		async cell(code, { signal } = {}) {
@@ -90,38 +108,45 @@ export function createExtensionHarness({ root, sessionManager, startup } = {}) {
 			const entryId = sessionManager.appendMessage(message);
 			return { ...result, text: result.content[0].text, entryId };
 		},
-		// Like a codemode tool call: cells are nested calls whose results Pi does not save.
+		// Like a codemode tool call: cells are nested calls whose results Pi does not save. The script
+		// receives structured results, and its own result is what the model sees.
 		async codemode(script) {
 			const parentToolCallId = `tool-${++toolIndex}`;
 			let nested = 0;
-			const ipython = async (code) => {
+			const ipython = async (code, { signal, onUpdate } = {}) => {
 				const toolCallId = `${parentToolCallId}/${++nested}`;
-				const result = await tool.execute(toolCallId, { code }, undefined, () => {}, ctx);
-				const hook = await handlers.get("tool_result")?.({
-					type: "tool_result",
-					toolName: "ipython",
-					toolCallId,
-					parentToolCallId,
-					input: { code },
-					content: result.content,
-					details: result.details,
-					isError: false,
-				}, ctx);
-				if (hook?.isError) throw new Error(result.content[0].text);
+				let executed;
+				try {
+					executed = await tool.execute(toolCallId, { code }, signal, onUpdate ?? (() => {}), ctx);
+				} catch (error) {
+					executed = { content: [{ type: "text", text: error.message }], details: {}, isError: true };
+				}
+				const result = await finalize({ toolName: "ipython", toolCallId, parentToolCallId, input: { code } }, executed);
+				if (tool.outputSchema && result.structuredContent !== undefined) return result.structuredContent;
+				if (result.isError) throw new Error(result.content[0].text);
 				return result.content[0].text;
 			};
+			let value;
+			let failure;
 			try {
-				return await script(ipython);
-			} finally {
-				sessionManager.appendMessage({
-					role: "toolResult",
-					toolCallId: parentToolCallId,
-					toolName: "codemode",
-					content: [{ type: "text", text: "script finished" }],
-					isError: false,
-					timestamp: Date.now(),
-				});
+				value = await script(ipython);
+			} catch (error) {
+				failure = error;
 			}
+			const result = await finalize({ toolName: "codemode", toolCallId: parentToolCallId, input: {} }, {
+				content: [{ type: "text", text: failure ? `Script failed\n${failure.message}` : "Script completed" }],
+				details: {},
+				isError: failure !== undefined,
+			});
+			sessionManager.appendMessage({
+				role: "toolResult",
+				toolCallId: parentToolCallId,
+				toolName: "codemode",
+				content: result.content,
+				isError: result.isError,
+				timestamp: Date.now(),
+			});
+			return { value, isError: result.isError, text: result.content.map((block) => block.text).join("\n") };
 		},
 		user(content) {
 			return sessionManager.appendMessage({ role: "user", content, timestamp: Date.now() });

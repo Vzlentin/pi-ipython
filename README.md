@@ -56,6 +56,14 @@ History is plain text, recorded from the first tool call after loading the exten
 
 Cancellation and output overflow first send SIGINT to the kernel process group. If the cell stops within 3 seconds, its partial output is returned as an error and kernel state is preserved. Otherwise the kernel and associated child work are killed. Top-level `await` is supported, including a signal-wakeup workaround for ipykernel 7.
 
+## Codemode scripts
+
+In a `codemode` script, `tools.ipython` resolves to an object with `status`, `output`, `executionCount`, `error` (`ename` and `evalue`), `truncated`, `fullOutputPath`, and `notices`. A Python exception or an interrupted cell resolves with `status: "error"`, so the script can check it and keep going on the same kernel. The call rejects when the kernel is lost.
+
+`notices` holds kernel restarts and checkpoint restores that happened before the cell ran. They are also appended to the script's own result, so the model sees them even when the script does not return them.
+
+Cells get their code as a string. To pass script data in, embed it as a JSON string, for example `json.loads(${JSON.stringify(JSON.stringify(data))})`.
+
 ## Persistence
 
 By default, each completed Pi `ipython` cell receives a checkpoint ID and its public, supported variables are saved in the background. Before the next cell, the extension waits for that save and finds the nearest IPython checkpoint on the current conversation branch. Navigating with `/tree`, resuming, forking, reloading, or recovering from a crash therefore restores that branch's latest committed cell. If its newest checkpoint is unavailable, the next older committed checkpoint is used; a branch with no IPython cells resets the namespace to its startup state.

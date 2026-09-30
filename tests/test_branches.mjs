@@ -104,17 +104,54 @@ try {
 		await ipython("nested = 5");
 		return ipython("print(nested * 2)");
 	});
-	assert.match(script, /10/);
-	assert.doesNotMatch(script, /ipython_state_restored/);
+	assert.equal(script.value.status, "ok");
+	assert.equal(script.value.output, "10\n");
+	assert.deepEqual(script.value.notices, []);
+	assert.doesNotMatch(script.text, /ipython_state_restored/);
 	const afterScript = await extension.cell("print(nested)");
 	assert.match(afterScript.text, /5/);
 	assert.doesNotMatch(afterScript.text, /ipython_state_restored/);
 
+	// A Python exception reaches the script as data, and the next cell runs on the same kernel.
+	const raised = await extension.codemode(async (ipython) => [
+		await ipython("before_error = 1\nraise ValueError('as data')"),
+		await ipython("before_error + 1"),
+	]);
+	assert.equal(raised.value[0].status, "error");
+	assert.deepEqual(raised.value[0].error, { ename: "ValueError", evalue: "as data" });
+	assert.match(raised.value[0].output, /ValueError: as data/);
+	assert.equal(raised.value[1].output, "2\n");
+	assert.equal(raised.isError, false);
+
+	// Cancelling a running cell interrupts it and keeps the kernel state.
+	const interrupted = await extension.codemode(async (ipython) => {
+		const controller = new AbortController();
+		const stopped = await ipython("print('cell running', flush=True)\nimport time\ntime.sleep(30)", {
+			signal: controller.signal,
+			onUpdate: (update) => { if (update.content[0].text.includes("cell running")) controller.abort(); },
+		});
+		return [stopped, await ipython("before_error")];
+	});
+	assert.equal(interrupted.value[0].status, "error");
+	assert.equal(interrupted.value[0].error.ename, "Interrupted");
+	assert.equal(interrupted.value[1].output, "1\n");
+	assert.deepEqual(interrupted.value[1].notices, []);
+
+	// A lost kernel rejects the call. The next cell reports the reset to the script, and the model sees it too.
+	const crashed = await extension.codemode(async (ipython) => {
+		await assert.rejects(ipython("import os; os._exit(17)"), /kernel state was lost/);
+		return ipython("print(before_error)");
+	});
+	assert.equal(crashed.value.output, "1\n");
+	assert.match(crashed.value.notices.join("\n"), /ipython_kernel_reset[\s\S]*ipython_state_restored/);
+	assert.match(crashed.text, /ipython_kernel_reset[\s\S]*ipython_state_restored/);
+
 	// A failed script keeps the state of its earlier cells, and a reload restores it.
-	await assert.rejects(extension.codemode(async (ipython) => {
+	const failedScript = await extension.codemode(async (ipython) => {
 		await ipython("partial_work = 'kept'");
-		await ipython("raise ValueError('script fixture')");
-	}), /script fixture/);
+		throw new Error("script fixture");
+	});
+	assert.equal(failedScript.isError, true);
 	await extension.shutdown("reload");
 	extension = createExtensionHarness({ root, sessionManager: manager, startup });
 	const reloaded = await extension.cell("print(nested, partial_work)");
