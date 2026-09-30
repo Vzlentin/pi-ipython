@@ -26,7 +26,7 @@ const pi = {
 		calls.push(args);
 		const [group, action, id] = args;
 		assert.equal(options.timeout, action === "wait-output" ? 125000 : 5000);
-		if (action === "run") assert.match(args[3], /^printf '\\033\[2J\\033\[3J\\033\[H'; cat '[^']+'; exec /);
+		if (action === "run") assert.match(args[3], /^printf '\\033\[2J\\033\[3J\\033\[H'; \/bin\/cat '[^']+'; exec /);
 		let result = {};
 		if (action === "current") {
 			assert.ok(args.includes("--current"));
@@ -99,7 +99,7 @@ try {
 	assert.equal(panes.size, 1);
 	assert.equal(nextPane, 1);
 	const command = calls.find((args) => args[1] === "run")[3];
-	assert.match(command, /; cat '[^']+'; exec 'env' 'JUPYTER_PATH=[^']+\/extensions\/\.python\/share\/jupyter' 'uv' 'tool' 'run' .*'--from' 'euporie==2\.10\.4' 'euporie-console' '--connection-file' /);
+	assert.match(command, /; \/bin\/cat '[^']+'; exec 'env' 'JUPYTER_PATH=[^']+\/extensions\/\.python\/share\/jupyter' 'uv' 'tool' 'run' .*'--from' 'euporie==2\.10\.4' 'euporie-console' '--connection-file' /);
 	assert.match(command, /'--kernel-name' 'python3' '--show-remote-inputs' '--show-remote-outputs' '--no-mouse-support' '--no-lsp'$/);
 	const file = command.match(/cat '([^']+)';/)[1];
 	assert.equal(statSync(file).mode & 0o777, 0o600);
@@ -111,6 +111,13 @@ try {
 	assert.match(text, /replacement/);
 	assert.doesNotMatch(text, /\x1b|clipboard|\x00/);
 	assert.match(text, /Cell 1 \| ok/);
+
+	// A shell alias must not replace history output with an interactive pager.
+	writeFileSync(join(connectionDirectory, "uv"), "#!/bin/sh\nprintf 'viewer started\\n'\n", { mode: 0o700 });
+	const launched = await promisify(execFile)("bash", ["--noprofile", "--norc", "-c",
+		"shopt -s expand_aliases\nalias cat=false\neval \"$1\"", "cells-test", command,
+	], { env: { ...process.env, PATH: `${connectionDirectory}:${process.env.PATH}` }, timeout: 5_000 });
+	assert.equal(launched.stdout, `\x1b[2J\x1b[3J\x1b[H${text}viewer started\n`);
 
 	// A transient CLI failure must not forget ownership or open a second pane.
 	failGet = true;

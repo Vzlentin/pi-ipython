@@ -118,7 +118,8 @@ export class CellsView {
 		const connectionCopy = join(dirname(file), "kernel.json");
 		writeFileSync(connectionCopy, readFileSync(connectionFile), { mode: 0o600 });
 		// History stays in terminal scrollback; Euporie renders new cells without replaying old code.
-		const command = `cat ${shellQuote(file)}; exec ${[
+		// Shell aliases can open a pager and block the console launch.
+		const command = `/bin/cat ${shellQuote(file)}; exec ${[
 			// Euporie needs a discoverable kernelspec even when attaching to an existing kernel.
 			"env", `JUPYTER_PATH=${fileURLToPath(new URL("./.python/share/jupyter", import.meta.url))}`,
 			"uv", "tool", "run", "--no-config", "--python", "3.12", "--from", "euporie==2.10.4",
