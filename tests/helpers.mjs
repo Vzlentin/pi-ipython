@@ -70,6 +70,7 @@ export function createExtensionHarness({ root, sessionManager, startup } = {}) {
 		registerTool(definition) { tool = definition; },
 		registerCommand() {},
 		registerShortcut() {},
+		appendEntry(customType, data) { sessionManager.appendCustomEntry(customType, data); },
 		exec: execShim,
 	});
 	return {
@@ -88,6 +89,39 @@ export function createExtensionHarness({ root, sessionManager, startup } = {}) {
 			};
 			const entryId = sessionManager.appendMessage(message);
 			return { ...result, text: result.content[0].text, entryId };
+		},
+		// Like a codemode tool call: cells are nested calls whose results Pi does not save.
+		async codemode(script) {
+			const parentToolCallId = `tool-${++toolIndex}`;
+			let nested = 0;
+			const ipython = async (code) => {
+				const toolCallId = `${parentToolCallId}/${++nested}`;
+				const result = await tool.execute(toolCallId, { code }, undefined, () => {}, ctx);
+				const hook = await handlers.get("tool_result")?.({
+					type: "tool_result",
+					toolName: "ipython",
+					toolCallId,
+					parentToolCallId,
+					input: { code },
+					content: result.content,
+					details: result.details,
+					isError: false,
+				}, ctx);
+				if (hook?.isError) throw new Error(result.content[0].text);
+				return result.content[0].text;
+			};
+			try {
+				return await script(ipython);
+			} finally {
+				sessionManager.appendMessage({
+					role: "toolResult",
+					toolCallId: parentToolCallId,
+					toolName: "codemode",
+					content: [{ type: "text", text: "script finished" }],
+					isError: false,
+					timestamp: Date.now(),
+				});
+			}
 		},
 		user(content) {
 			return sessionManager.appendMessage({ role: "user", content, timestamp: Date.now() });

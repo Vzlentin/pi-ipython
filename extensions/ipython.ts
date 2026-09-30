@@ -12,7 +12,7 @@ import {
 import { Type } from "typebox";
 import { CellsView } from "./cells.ts";
 import { describeError, INTERRUPT_GRACE_MS, KernelRuntime, OUTPUT_CAPTURE_LIMIT_BYTES } from "./kernel-runtime.ts";
-import { createRuntime } from "./persistence.ts";
+import { CHECKPOINT_ENTRY_TYPE, createRuntime } from "./persistence.ts";
 
 const RESET_NOTICE = [
 	"<ipython_kernel_reset>",
@@ -199,11 +199,15 @@ export default function ipythonExtension(pi: ExtensionAPI) {
 		},
 	});
 
-	// Mark failed cells as errors without throwing away their output.
 	pi.on("tool_result", (event) => {
-		if (event.toolName === "ipython" && (event.details as IpythonDetails | undefined)?.status === "error") {
-			return { isError: true };
+		if (event.toolName !== "ipython") return;
+		const details = event.details as IpythonDetails | undefined;
+		// Must be on the branch before the calling tool runs its next cell.
+		if (event.parentToolCallId !== undefined && details?.checkpoint !== undefined) {
+			pi.appendEntry(CHECKPOINT_ENTRY_TYPE, { checkpoint: details.checkpoint });
 		}
+		// Mark failed cells as errors without throwing away their output.
+		if (details?.status === "error") return { isError: true };
 	});
 
 	pi.on("session_shutdown", async () => {

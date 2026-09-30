@@ -58,7 +58,9 @@ Cancellation and output overflow first send SIGINT to the kernel process group. 
 
 ## Persistence
 
-By default, each completed Pi `ipython` cell receives a checkpoint ID and its public, supported variables are saved in the background. Before the next cell, the extension waits for that save and finds the nearest IPython result on the current conversation branch. Navigating with `/tree`, resuming, forking, reloading, or recovering from a crash therefore restores that branch's latest committed cell. If its newest checkpoint is unavailable, the next older committed checkpoint is used; a branch with no IPython cells resets the namespace to its startup state.
+By default, each completed Pi `ipython` cell receives a checkpoint ID and its public, supported variables are saved in the background. Before the next cell, the extension waits for that save and finds the nearest IPython checkpoint on the current conversation branch. Navigating with `/tree`, resuming, forking, reloading, or recovering from a crash therefore restores that branch's latest committed cell. If its newest checkpoint is unavailable, the next older committed checkpoint is used; a branch with no IPython cells resets the namespace to its startup state.
+
+Cells that another tool runs, such as a `codemode` script, are checkpointed too. Pi does not save their results, so each checkpoint ID goes into an `ipython-checkpoint` custom entry on the branch. If the script fails later, its earlier cells stay checkpointed because the kernel state already changed.
 
 The result after a restore reports its source cell, restored names, and skipped values. A failed background save does not roll back the live kernel. A failed save is reported with the next result. A cancelled restore is retried on the next call; a restore that fails or times out is not, and the cell runs on the namespace left behind. If restoring a value kills the kernel, that value is deleted from the store and the restore is retried on a fresh kernel, up to three attempts per call.
 

@@ -74,13 +74,19 @@ export function createRuntime(pi: ExtensionAPI, cwd: string): { kernel: KernelRu
 	return { kernel, checkpoints: new Checkpoints(kernel, true) };
 }
 
+/** Custom entry type for checkpoints of cells that another tool ran, since Pi does not save their results. */
+export const CHECKPOINT_ENTRY_TYPE = "ipython-checkpoint";
+
 function checkpointIds(branch: SessionEntry[]): string[] {
 	const ids: string[] = [];
 	for (let index = branch.length - 1; index >= 0; index -= 1) {
 		const entry = branch[index];
-		if (entry.type !== "message" || entry.message.role !== "toolResult") continue;
-		if (entry.message.toolName !== "ipython") continue;
-		const checkpoint = (entry.message.details as { checkpoint?: unknown } | undefined)?.checkpoint;
+		let checkpoint: unknown;
+		if (entry.type === "custom" && entry.customType === CHECKPOINT_ENTRY_TYPE) {
+			checkpoint = (entry.data as { checkpoint?: unknown } | undefined)?.checkpoint;
+		} else if (entry.type === "message" && entry.message.role === "toolResult" && entry.message.toolName === "ipython") {
+			checkpoint = (entry.message.details as { checkpoint?: unknown } | undefined)?.checkpoint;
+		}
 		if (typeof checkpoint === "string") ids.push(checkpoint);
 	}
 	return ids;

@@ -97,6 +97,34 @@ try {
 	assert.match(consecutive.text, /True/);
 	assert.doesNotMatch(consecutive.text, /ipython_state_restored/);
 	await extension.cell("live_file.close()");
+
+	// Cells that a codemode script runs share state with each other and with later direct cells.
+	const beforeScripts = extension.user("run a script");
+	const script = await extension.codemode(async (ipython) => {
+		await ipython("nested = 5");
+		return ipython("print(nested * 2)");
+	});
+	assert.match(script, /10/);
+	assert.doesNotMatch(script, /ipython_state_restored/);
+	const afterScript = await extension.cell("print(nested)");
+	assert.match(afterScript.text, /5/);
+	assert.doesNotMatch(afterScript.text, /ipython_state_restored/);
+
+	// A failed script keeps the state of its earlier cells, and a reload restores it.
+	await assert.rejects(extension.codemode(async (ipython) => {
+		await ipython("partial_work = 'kept'");
+		await ipython("raise ValueError('script fixture')");
+	}), /script fixture/);
+	await extension.shutdown("reload");
+	extension = createExtensionHarness({ root, sessionManager: manager, startup });
+	const reloaded = await extension.cell("print(nested, partial_work)");
+	assert.match(reloaded.text, /5 kept/);
+	assert.match(reloaded.text, /ipython_state_restored/);
+
+	// A branch before the scripts drops their names.
+	manager.branch(beforeScripts);
+	const beforeState = await extension.cell("print('nested' in globals(), 'partial_work' in globals())");
+	assert.match(beforeState.text, /False False/);
 } finally {
 	try { chmodSync(join(cache, "pi-ipython", "checkpoints", "manifests"), 0o700); } catch {}
 	await extension.shutdown("quit");
@@ -104,4 +132,4 @@ try {
 	restoreEnvironment();
 }
 
-console.log("branches: edit, empty branch, later leaf, fork, fallback, crash, failed save and no-op sync passed");
+console.log("branches: edit, empty branch, later leaf, fork, fallback, crash, failed save, no-op sync and codemode cells passed");
