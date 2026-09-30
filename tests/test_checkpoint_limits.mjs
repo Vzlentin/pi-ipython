@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
@@ -8,7 +8,7 @@ import {
 	createExtensionHarness, createKernel, preserveEnvironment, runKernel, waitFor,
 } from "./helpers.mjs";
 
-const root = mkdtempSync(join(tmpdir(), "pi-ipython-limits-"));
+const root = realpathSync(mkdtempSync(join(tmpdir(), "pi-ipython-limits-")));
 const restoreEnvironment = preserveEnvironment("XDG_CACHE_HOME", "PI_IPYTHON_PERSISTENCE");
 process.env.XDG_CACHE_HOME = join(root, "cache");
 delete process.env.PI_IPYTHON_PERSISTENCE;

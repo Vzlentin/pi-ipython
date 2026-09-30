@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createKernel, runKernel } from "./helpers.mjs";
@@ -15,7 +15,7 @@ const alive = (pgid) => {
 const pgidOf = async (kernel, cwd) =>
 	Number((await runKernel(kernel, "import os; print(os.getpgid(0))", cwd)).result.output.trim());
 
-const root = mkdtempSync(join(tmpdir(), "pi-ipython-kernel-"));
+const root = realpathSync(mkdtempSync(join(tmpdir(), "pi-ipython-kernel-")));
 const first = join(root, "first");
 const second = join(root, "second");
 mkdirSync(first);

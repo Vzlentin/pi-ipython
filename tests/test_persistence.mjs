@@ -11,7 +11,7 @@ import {
 	createExtensionHarness, createKernel, preserveEnvironment, runKernel,
 } from "./helpers.mjs";
 
-const root = mkdtempSync(join(tmpdir(), "pi-ipython-persistence-"));
+const root = realpathSync(mkdtempSync(join(tmpdir(), "pi-ipython-persistence-")));
 const restoreEnvironment = preserveEnvironment("XDG_CACHE_HOME", "PI_IPYTHON_PERSISTENCE");
 const cache = join(root, "cache");
 process.env.XDG_CACHE_HOME = cache;
