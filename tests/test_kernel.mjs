@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { OUTPUT_CAPTURE_LIMIT_BYTES } from "../extensions/kernel-runtime.ts";
 import { createKernel, runKernel } from "./helpers.mjs";
 
 const alive = (pgid) => {
@@ -24,6 +25,12 @@ mkdirSync(second);
 // With no listener, the kernel runs, keeps state, applies each cell's cwd, resets and cleans up.
 const plain = createKernel();
 let plainPgid;
+const captures = new Map();
+const assertCaptured = (marker, path) => {
+	const saved = readFileSync(path, "utf8");
+	assert.ok(Buffer.byteLength(saved) > OUTPUT_CAPTURE_LIMIT_BYTES);
+	assert.equal(saved.replaceAll(`${marker.repeat(10000)}\n`, "").replaceAll(marker, ""), "");
+};
 try {
 	const one = await runKernel(plain, "import os\nvalue = 41\nprint(os.getcwd())", first);
 	assert.equal(one.result.status, "ok");
@@ -55,11 +62,15 @@ try {
 		assert.equal(alive(oldPgid), true);
 		assert.equal((await runKernel(plain, "print(value)", first)).result.output.trim(), "41");
 	}
-	const overflow = await runKernel(plain, "while True: print('x' * 10000, flush=True)", first);
-	assert.equal(overflow.result.status, "error");
-	assert.match(overflow.result.output, /Captured output saved to:/);
-	assert.match(overflow.result.output, /kernel state preserved/);
-	assert.equal((await runKernel(plain, "print(value)", first)).result.output.trim(), "41");
+	for (const marker of ["x", "y"]) {
+		const overflow = await runKernel(plain, `while True: print('${marker}' * 10000, flush=True)`, first);
+		assert.equal(overflow.result.status, "error");
+		assert.match(overflow.result.output, /kernel state preserved/);
+		const path = overflow.result.output.match(/Captured output saved to: (.+?); interrupted/)[1];
+		assertCaptured(marker, path);
+		captures.set(marker, path);
+		assert.equal((await runKernel(plain, "print(value)", first)).result.output.trim(), "41");
+	}
 	const generation = plain.generation;
 	const began = Date.now();
 	await assert.rejects(
@@ -73,11 +84,16 @@ try {
 	assert.ok(plain.generation > generation);
 	assert.equal(reset.result.output.trim(), "False");
 	assert.equal((await runKernel(plain, "pass", first)).kernelReset, false);
+	// Captures outlive the forced kill and the reset, and a later capture does not replace an earlier one.
+	for (const [marker, path] of captures) assertCaptured(marker, path);
 	plainPgid = await pgidOf(plain, first);
 } finally {
 	await plain.shutdown();
 }
 assert.equal(alive(plainPgid), false);
+for (const path of captures.values()) assert.equal(existsSync(dirname(path)), false);
+await plain.shutdown();
+assert.throws(() => plain.saveOutput("after shutdown"), /shutting down/);
 
 // A listener's environment and startup code reach every kernel start, after its promise settles.
 // The runtime's own startup code runs after the listener's.
@@ -89,17 +105,23 @@ const hooked = createKernel((event) => {
 		event.env.PI_IPYTHON_HOOK = `env-${starts}`;
 	}));
 }, ["after_hook = hook_value * 10"]);
+let beforeCrash;
 try {
 	const seen = await runKernel(hooked, "import os\nprint(hook_value, after_hook, os.environ['PI_IPYTHON_HOOK'])", first);
 	assert.equal(seen.result.output.trim(), "1 10 env-1");
 	assert.equal(process.env.PI_IPYTHON_HOOK, undefined);
+	beforeCrash = hooked.saveOutput("saved before the crash\n");
 	await assert.rejects(runKernel(hooked, "os._exit(1)", first), /kernel state was lost/);
 	const again = await runKernel(hooked, "import os\nprint(hook_value, after_hook, os.environ['PI_IPYTHON_HOOK'])", first);
 	assert.equal(again.kernelReset, true);
 	assert.equal(again.result.output.trim(), "2 20 env-2");
+	assert.equal(readFileSync(beforeCrash, "utf8"), "saved before the crash\n");
+	// Shutdown also removes saved output when no kernel remains.
+	await assert.rejects(runKernel(hooked, "os._exit(1)", first), /kernel state was lost/);
 } finally {
 	await hooked.shutdown();
 }
+assert.equal(existsSync(dirname(beforeCrash)), false);
 
 // A failing startup snippet fails the kernel start instead of running cells without it.
 const broken = createKernel((event) => event.startupCode.push("raise RuntimeError('startup fixture')"));
@@ -110,4 +132,4 @@ try {
 	rmSync(root, { recursive: true, force: true });
 }
 
-console.log("kernel: state, cwd, reset, cleanup, startup hook and startup failure passed");
+console.log("kernel: state, cwd, reset, cleanup, saved output, startup hook and startup failure passed");

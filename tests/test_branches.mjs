@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
-import { chmodSync, existsSync, mkdtempSync, rmSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { copyBranch, createExtensionHarness, preserveEnvironment, waitFor } from "./helpers.mjs";
 
@@ -14,6 +14,9 @@ const manager = SessionManager.inMemory(root);
 const startup = (event) => event.startupCode.push("startup_only = 7");
 let extension = createExtensionHarness({ root, sessionManager: manager, startup });
 const manifestPath = (id) => join(cache, "pi-ipython", "checkpoints", "manifests", `${id}.json`);
+// Longer than the tool's line limit, so the result keeps only the tail and saves the full output.
+const longOutput = (label) => Array.from({ length: 3000 }, (_, index) => `${label} ${index}\n`).join("");
+const printLong = (label) => `print(''.join(f'${label} {index}\\n' for index in range(3000)), end='')`;
 
 try {
 	// Editing a prompt returns to the state after the shared cells, not abandoned work.
@@ -49,17 +52,31 @@ try {
 	assert.match(retried.text, /ipython_state_restored/);
 	manager.branch(later.entryId);
 
+	// Truncated output is saved in full for the rest of the session.
+	const mainLong = await extension.cell(printLong("main"));
+	const mainSaved = mainLong.details.fullOutputPath;
+	assert.equal(mainLong.details.truncated, true);
+	assert.ok(mainLong.text.includes(`Full output saved to: ${mainSaved}`));
+	assert.equal(readFileSync(mainSaved, "utf8"), longOutput("main"));
+
 	// A forked SessionManager carries checkpoint details and restores the parent's branch.
+	// Its session saves output separately, and its shutdown leaves the parent's output alone.
 	const forkManager = SessionManager.inMemory(root);
 	copyBranch(manager, forkManager);
 	const fork = createExtensionHarness({ root, sessionManager: forkManager, startup });
+	let forkSaved;
 	try {
 		const copied = await fork.cell("print(df, later_leaf)");
 		assert.match(copied.text, /\[2, 4, 6\] 99/);
 		assert.match(copied.text, /ipython_state_restored/);
+		forkSaved = (await fork.cell(printLong("fork"))).details.fullOutputPath;
+		assert.equal(readFileSync(forkSaved, "utf8"), longOutput("fork"));
+		assert.equal(readFileSync(mainSaved, "utf8"), longOutput("main"));
 	} finally {
 		await fork.shutdown("quit");
 	}
+	assert.equal(existsSync(dirname(forkSaved)), false);
+	assert.equal(readFileSync(mainSaved, "utf8"), longOutput("main"));
 
 	// If the nearest manifest was evicted, restore the next committed ancestor.
 	const older = await extension.cell("older_only = 1");
@@ -146,13 +163,23 @@ try {
 	assert.match(crashed.value.notices.join("\n"), /ipython_kernel_reset[\s\S]*ipython_state_restored/);
 	assert.match(crashed.text, /ipython_kernel_reset[\s\S]*ipython_state_restored/);
 
+	// Saved output outlives later cells, crashes and cancellation. A script's cell saves to a new file.
+	assert.equal(readFileSync(mainSaved, "utf8"), longOutput("main"));
+	const scriptLong = await extension.codemode((ipython) => ipython(printLong("script")));
+	const scriptSaved = scriptLong.value.fullOutputPath;
+	assert.notEqual(scriptSaved, mainSaved);
+	assert.equal(readFileSync(scriptSaved, "utf8"), longOutput("script"));
+	assert.equal(readFileSync(mainSaved, "utf8"), longOutput("main"));
+
 	// A failed script keeps the state of its earlier cells, and a reload restores it.
+	// The reload removes the session's saved output.
 	const failedScript = await extension.codemode(async (ipython) => {
 		await ipython("partial_work = 'kept'");
 		throw new Error("script fixture");
 	});
 	assert.equal(failedScript.isError, true);
 	await extension.shutdown("reload");
+	for (const saved of [mainSaved, scriptSaved]) assert.equal(existsSync(dirname(saved)), false);
 	extension = createExtensionHarness({ root, sessionManager: manager, startup });
 	const reloaded = await extension.cell("print(nested, partial_work)");
 	assert.match(reloaded.text, /5 kept/);
@@ -162,6 +189,21 @@ try {
 	manager.branch(beforeScripts);
 	const beforeState = await extension.cell("print('nested' in globals(), 'partial_work' in globals())");
 	assert.match(beforeState.text, /False False/);
+
+	// The other shutdown reasons also remove saved output, after a crash leaves no kernel. A repeated shutdown is harmless.
+	for (const reason of ["new", "resume", "fork"]) {
+		const session = createExtensionHarness({ root, sessionManager: SessionManager.inMemory(root), startup });
+		let saved;
+		try {
+			saved = (await session.cell(printLong(reason))).details.fullOutputPath;
+			assert.equal(readFileSync(saved, "utf8"), longOutput(reason));
+			await assert.rejects(session.cell("import os; os._exit(17)"), /kernel state was lost/);
+		} finally {
+			await session.shutdown(reason);
+		}
+		await session.shutdown(reason);
+		assert.equal(existsSync(dirname(saved)), false);
+	}
 } finally {
 	try { chmodSync(join(cache, "pi-ipython", "checkpoints", "manifests"), 0o700); } catch {}
 	await extension.shutdown("quit");
@@ -169,4 +211,4 @@ try {
 	restoreEnvironment();
 }
 
-console.log("branches: edit, empty branch, later leaf, fork, fallback, crash, failed save, no-op sync and codemode cells passed");
+console.log("branches: edit, empty branch, later leaf, fork, fallback, crash, failed save, no-op sync, codemode cells and saved output passed");

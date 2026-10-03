@@ -1,5 +1,5 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 import { createInterface } from "node:readline";
@@ -117,6 +117,8 @@ export class KernelRuntime {
 	private pendingResetNotice = false;
 	private disposed = false;
 	private evaluateIndex = 0;
+	private outputDirectory?: string;
+	private outputIndex = 0;
 	private _generation = 0;
 	private shutdownPromise?: Promise<void>;
 	private readonly lifecycle = new AbortController();
@@ -132,6 +134,15 @@ export class KernelRuntime {
 	/** Increments each time a kernel becomes ready. */
 	get generation(): number {
 		return this._generation;
+	}
+
+	/** Writes `text` to a new file that survives kernel restarts and is deleted by `shutdown`. */
+	saveOutput(text: string): string {
+		if (this.disposed) throw new Error("IPython runtime is shutting down");
+		this.outputDirectory ??= mkdtempSync(join(tmpdir(), "pi-ipython-output-"));
+		const path = join(this.outputDirectory, `output-${++this.outputIndex}.txt`);
+		writeFileSync(path, text, "utf8");
+		return path;
 	}
 
 	async execute(
@@ -444,10 +455,7 @@ export class KernelRuntime {
 			if (Buffer.byteLength(active.output, "utf8") > OUTPUT_CAPTURE_LIMIT_BYTES) {
 				let captureNotice: string;
 				try {
-					const directory = mkdtempSync(join(tmpdir(), "pi-ipython-overflow-"));
-					const capturedPath = join(directory, "output.txt");
-					writeFileSync(capturedPath, stripAnsi(active.output), "utf8");
-					captureNotice = `Captured output saved to: ${capturedPath}`;
+					captureNotice = `Captured output saved to: ${this.saveOutput(stripAnsi(active.output))}`;
 				} catch (error) {
 					captureNotice = `Could not save captured output: ${errorText(error)}`;
 				}
@@ -660,5 +668,6 @@ export class KernelRuntime {
 			});
 		}
 		await this.reapProcessGroup(kernelPgid);
+		if (this.outputDirectory) rmSync(this.outputDirectory, { recursive: true, force: true });
 	}
 }

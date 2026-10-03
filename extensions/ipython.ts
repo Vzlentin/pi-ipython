@@ -1,6 +1,3 @@
-import { mkdtemp, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import type { JsonObject } from "@earendil-works/pi-ai";
 import {
 	DEFAULT_MAX_BYTES,
@@ -71,12 +68,12 @@ function partialText(output: string): string {
 	return `[Live output truncated; showing the tail]\n${truncated.content}`;
 }
 
-async function finalText(output: string): Promise<{
+function finalText(output: string, kernel: KernelRuntime): {
 	text: string;
 	output: string;
 	truncated: boolean;
 	fullOutputPath?: string;
-}> {
+} {
 	const clean = stripAnsi(output);
 	const truncated = truncateTail(clean, {
 		maxLines: DEFAULT_MAX_LINES,
@@ -86,9 +83,7 @@ async function finalText(output: string): Promise<{
 		return { text: truncated.content || "[no output]", output: truncated.content, truncated: false };
 	}
 
-	const directory = await mkdtemp(join(tmpdir(), "pi-ipython-"));
-	const fullOutputPath = join(directory, "output.txt");
-	await writeFile(fullOutputPath, clean, "utf8");
+	const fullOutputPath = kernel.saveOutput(clean);
 	const omittedLines = truncated.totalLines - truncated.outputLines;
 	const omittedBytes = truncated.totalBytes - truncated.outputBytes;
 	const notice = [
@@ -201,7 +196,7 @@ export default function ipythonExtension(pi: ExtensionAPI) {
 			if (notice) transcript?.note(notice);
 			if (result.status !== "ok" && !result.output) transcript?.note(describeError(result.error));
 			transcript?.finish(`${result.status}${result.executionCount === undefined ? "" : ` | In [${result.executionCount}]`}`);
-			const formatted = await finalText(result.output);
+			const formatted = finalText(result.output, kernel);
 			let visible = formatted.text;
 			if (notice) {
 				visible = formatted.text === "[no output]" ? notice : `${notice}\n\n${formatted.text}`;
@@ -261,8 +256,11 @@ export default function ipythonExtension(pi: ExtensionAPI) {
 		try {
 			await closing?.checkpoints.close();
 		} finally {
-			await closing?.kernel.shutdown();
-			await cells.shutdown();
+			try {
+				await closing?.kernel.shutdown();
+			} finally {
+				await cells.shutdown();
+			}
 		}
 	});
 }

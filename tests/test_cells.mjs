@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { CellsView } from "../extensions/cells.ts";
 import { KernelRuntime } from "../extensions/kernel-runtime.ts";
 import ipythonExtension from "../extensions/ipython.ts";
@@ -244,6 +244,7 @@ const execute = KernelRuntime.prototype.execute;
 const getConnectionFile = KernelRuntime.prototype.getConnectionFile;
 let connectionRequests = 0;
 let executions = 0;
+let outputDirectory;
 try {
 	KernelRuntime.prototype.getConnectionFile = async () => { connectionRequests++; return firstConnection; };
 	KernelRuntime.prototype.execute = async (_id, _code, _cwd, _signal, progress, output) => {
@@ -279,7 +280,17 @@ try {
 	await assert.rejects(tool.execute("cancel", { code: "await pending" }, undefined, () => {}, ctx), /cancelled/);
 	assert.match(readFileSync(file, "utf8"), /Cell 3 \| error: Error: cancelled; kernel state lost/);
 	assert.deepEqual(notices, []);
-	await events.get("session_shutdown")();
+	// A failed removal of saved output is reported, and the console still closes.
+	KernelRuntime.prototype.execute = async () => ({
+		kernelReset: false,
+		result: { status: "ok", executionCount: 4, output: "line\n".repeat(3000) },
+	});
+	const long = await tool.execute("long", { code: "print('line\\n' * 3000, end='')" }, undefined, () => {}, ctx);
+	outputDirectory = dirname(long.details.fullOutputPath);
+	chmodSync(outputDirectory, 0o500);
+	assert.equal(panes.size, 1);
+	await assert.rejects(events.get("session_shutdown")(), (error) => String(error.path).startsWith(outputDirectory));
+	assert.equal(panes.size, 0);
 	assert.equal(existsSync(file), false);
 
 	process.env.HERDR_ENV = "0";
@@ -291,6 +302,10 @@ try {
 	KernelRuntime.prototype.execute = execute;
 	KernelRuntime.prototype.getConnectionFile = getConnectionFile;
 	await events.get("session_shutdown")();
+	if (outputDirectory) {
+		chmodSync(outputDirectory, 0o700);
+		rmSync(outputDirectory, { recursive: true, force: true });
+	}
 	if (originalPersistence === undefined) delete process.env.PI_IPYTHON_PERSISTENCE;
 	else process.env.PI_IPYTHON_PERSISTENCE = originalPersistence;
 	rmSync(connectionDirectory, { recursive: true, force: true });
