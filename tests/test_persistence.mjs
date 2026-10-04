@@ -146,6 +146,129 @@ await closing;
 	}
 }
 
+async function signalShutdown(base, mode) {
+	const hostRoot = join(base, `signal-${mode}`);
+	mkdirSync(hostRoot);
+	const ready = join(hostRoot, "ready");
+	const release = join(hostRoot, "release");
+	const idsPath = join(hostRoot, "ids.json");
+	const nativeExit = ["native", "recreate", "failed-close"].includes(mode);
+	const recordIds = `
+import os as _os, json as _json, pathlib as _pathlib
+_pathlib.Path(${JSON.stringify(idsPath)}).write_text(_json.dumps({
+    'bridgePid': _os.getppid(), 'bridgePgid': _os.getpgid(_os.getppid()),
+    'kernelPid': _os.getpid(), 'kernelPgid': _os.getpgid(0),
+}))`;
+	const hostCode = `
+import assert from 'node:assert/strict';
+import { chmodSync, existsSync, rmSync } from 'node:fs';
+import { dirname } from 'node:path';
+import { SessionManager } from '@earendil-works/pi-coding-agent';
+import { createExtensionHarness, waitFor } from ${JSON.stringify(new URL("./helpers.mjs", import.meta.url).href)};
+const mode = ${JSON.stringify(mode)};
+// Keep import-time exit hooks in the recreated-runtime native-exit case.
+if (mode !== 'recreate') process.removeAllListeners('SIGTERM');
+const root = ${JSON.stringify(hostRoot)};
+const harness = createExtensionHarness({
+    root, sessionManager: SessionManager.inMemory(root),
+    startup: (event) => event.startupCode.push(${JSON.stringify(recordIds)}),
+});
+let closing;
+let closed = false;
+const shutdown = () => closing ??= harness.shutdown().then(() => {
+    closed = true;
+    process.send('shutdown_complete');
+}).then(() => process.send('cleanup_complete'));
+// Keep the host alive even after all kernel work has stopped.
+setInterval(() => {}, 1_000);
+if (!${nativeExit} && mode !== 'sigint') process.once('SIGTERM', shutdown);
+if (mode === 'sigint') process.on('SIGINT', () => process.send('signal_received'));
+if (mode === 'recreate' || mode === 'failed-close') {
+    const first = await harness.cell(${JSON.stringify("print('line\\n' * 3000, end='')")});
+    const outputDirectory = dirname(first.details.fullOutputPath);
+    if (mode === 'failed-close') {
+        chmodSync(outputDirectory, 0o500);
+        try {
+            await assert.rejects(harness.shutdown(), (error) => error.path?.startsWith(outputDirectory));
+        } finally {
+            chmodSync(outputDirectory, 0o700);
+            rmSync(outputDirectory, { recursive: true, force: true });
+        }
+    } else await harness.shutdown();
+}
+if (mode === 'restart') {
+    await harness.cell('value = 42');
+    await assert.rejects(harness.cell("__import__('os')._exit(0)"), /lost|stopped/);
+}
+await harness.cell(${JSON.stringify(delayedSerialization(ready, release))});
+await waitFor(() => existsSync(${JSON.stringify(ready)}));
+if (mode !== 'initiating') {
+    shutdown();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(closed, false, 'shutdown must be draining the blocked checkpoint');
+}
+process.send('ready');
+`;
+	const host = spawn(process.execPath, ["--no-warnings", "--input-type=module", "--eval", hostCode], {
+		env: { ...process.env, XDG_CACHE_HOME: join(hostRoot, "cache") },
+		stdio: ["ignore", "pipe", "pipe", "ipc"],
+	});
+	const exited = new Promise((resolve) => host.once("exit", (code, signal) => resolve({ code, signal })));
+	const messages = new Set();
+	let diagnostics = "";
+	let ids;
+	host.stdout.on("data", (chunk) => { diagnostics += chunk; });
+	host.stderr.on("data", (chunk) => { diagnostics += chunk; });
+	host.on("message", (message) => messages.add(message));
+	const assertAlive = () => {
+		assert.equal(host.exitCode, null, diagnostics);
+		assert.equal(host.signalCode, null, diagnostics);
+	};
+	try {
+		await waitFor(() => {
+			assertAlive();
+			return existsSync(ready) && messages.has("ready");
+		}, 60_000);
+		ids = JSON.parse(readFileSync(idsPath, "utf8"));
+		for (const [name, id] of Object.entries(ids)) {
+			assert.ok(Number.isSafeInteger(id) && id > 1, name);
+			assert.ok(processExists(id, name.endsWith("Pgid")), name);
+		}
+		const signalledAt = performance.now();
+		assert.equal(host.kill(mode === "sigint" ? "SIGINT" : "SIGTERM"), true);
+		if (mode === "sigint") {
+			await waitFor(() => messages.has("signal_received"), 2_000);
+			await new Promise((resolve) => setTimeout(resolve, 250));
+			assertAlive();
+			assert.equal(messages.has("shutdown_complete"), false, "SIGINT must not interrupt the checkpoint drain");
+			for (const [name, id] of Object.entries(ids)) assert.ok(processExists(id, name.endsWith("Pgid")), name);
+			writeFileSync(release, "release");
+		}
+		await waitFor(() => {
+			if (!nativeExit) assertAlive();
+			const completed = nativeExit ? host.signalCode !== null
+				: messages.has("shutdown_complete") && messages.has("cleanup_complete");
+			return completed && Object.entries(ids).every(([name, id]) => !processExists(id, name.endsWith("Pgid")));
+		}, mode === "sigint" ? 10_000 : 2_000).catch((error) => {
+			throw new Error(`${mode}: messages=${[...messages]}, processes=${JSON.stringify(Object.entries(ids).filter(([name, id]) => processExists(id, name.endsWith("Pgid"))))}\n${diagnostics}`, { cause: error });
+		});
+		if (mode !== "sigint") assert.ok(performance.now() - signalledAt <= 2_000, `${mode}: shutdown exceeded two seconds`);
+		if (nativeExit) assert.deepEqual(await exited, { code: null, signal: "SIGTERM" });
+		else assertAlive();
+		assert.equal(diagnostics, "");
+	} finally {
+		// Do not let owner-death cleanup satisfy the shutdown assertions.
+		host.kill("SIGKILL");
+		await exited;
+		if (!ids && existsSync(idsPath)) ids = JSON.parse(readFileSync(idsPath, "utf8"));
+		for (const pgid of [ids?.kernelPgid, ids?.bridgePgid]) {
+			if (pgid) {
+				try { process.kill(-pgid, "SIGKILL"); } catch {}
+			}
+		}
+	}
+}
+
 const root = realpathSync(mkdtempSync(join(tmpdir(), "pi-ipython-persistence-")));
 const restoreEnvironment = preserveEnvironment("XDG_CACHE_HOME", "PI_IPYTHON_PERSISTENCE");
 const cache = join(root, "cache");
@@ -159,6 +282,9 @@ const manager = SessionManager.inMemory(root);
 let extension = createExtensionHarness({ root, sessionManager: manager, startup });
 
 try {
+	for (const mode of ["drain", "initiating", "native", "sigint", "recreate", "failed-close", "restart"]) {
+		await signalShutdown(root, mode);
+	}
 	const ownerDeathFailures = [];
 	for (const mode of ["cell", "checkpoint", "startup", "cleanup", "launch"]) {
 		try { await ownerDeath(root, mode); } catch (error) { ownerDeathFailures.push(new Error(mode, { cause: error })); }
@@ -379,4 +505,4 @@ print('saved')`);
 	restoreEnvironment();
 }
 
-console.log("persistence: owner-death cleanup, shutdown flush, round trips, dedup, GC, security, UUID validation, permissions and opt-out passed");
+console.log("persistence: signal shutdown, owner-death cleanup, shutdown flush, round trips, dedup, GC, security, UUID validation, permissions and opt-out passed");

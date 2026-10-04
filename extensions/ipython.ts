@@ -101,13 +101,28 @@ function finalText(output: string, kernel: KernelRuntime): {
 }
 
 export default function ipythonExtension(pi: ExtensionAPI) {
-	let runtime: ReturnType<typeof createRuntime> | undefined;
+	let runtime: (ReturnType<typeof createRuntime> & { sigterm: () => void }) | undefined;
 	// Checkpoint notices from opening the console, delivered with the next result.
 	let undelivered: string[] = [];
 	// Notices of cells that another tool ran, keyed by that tool's call until its result reaches the model.
 	const forwarded = new Map<string, string[]>();
 	const cells = new CellsView(pi);
-	const getRuntime = (ctx: ExtensionContext) => runtime ??= createRuntime(pi, ctx.cwd);
+	const getRuntime = (ctx: ExtensionContext) => {
+		if (runtime) return runtime;
+		const created = createRuntime(pi, ctx.cwd);
+		const sigterm = () => {
+			// Another handler can remove itself while shutdown is in progress.
+			const ownsExit = process.listeners("SIGTERM").every((listener) => listener === sigterm);
+			void created.kernel.shutdown().catch(() => {}).finally(() => {
+				if (ownsExit) {
+					process.off("SIGTERM", sigterm);
+					process.kill(process.pid, "SIGTERM");
+				}
+			});
+		};
+		process.prependOnceListener("SIGTERM", sigterm);
+		return runtime = { ...created, sigterm };
+	};
 	const toggleCells = async (ctx: ExtensionContext) => {
 		if (ctx.mode !== "tui" || process.env.HERDR_ENV !== "1") {
 			ctx.ui.notify("/cells requires interactive Pi in Herdr.", "warning");
@@ -260,6 +275,7 @@ export default function ipythonExtension(pi: ExtensionAPI) {
 			try {
 				await closing?.kernel.shutdown();
 			} finally {
+				if (closing) process.off("SIGTERM", closing.sigterm);
 				await cells.shutdown();
 			}
 		}
