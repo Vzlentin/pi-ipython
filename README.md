@@ -10,7 +10,7 @@ native IPython magics. It has no RLM support of its own;
 Requirements:
 
 - macOS or Linux, with Bash and `lockf` (macOS) or `flock` (Linux).
-- Node.js 22.19 or newer, npm, Git, and Pi (tested with 0.87.1).
+- Node.js 22.19 or newer, npm, Git, and Pi (tested with 1.0.0).
 - `uv` on `PATH`. The first tool call provisions an extension-owned Python 3.12
   runtime with ipykernel, jupyter-client, and cloudpickle in `extensions/.python`,
   so it needs network access.
