@@ -77,6 +77,8 @@ interface ReadyWaiter {
 	reject: (error: Error) => void;
 }
 
+export class KernelLostError extends Error {}
+
 export function errorText(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
@@ -212,7 +214,7 @@ export class KernelRuntime {
 				callback();
 			};
 			active.resolve = (value) => settle(() => resolve(value));
-			active.reject = (error) => settle(() => reject(error));
+			active.reject = (error) => settle(() => reject(new KernelLostError(error.message, { cause: error })));
 
 			try {
 				this.child!.stdin.write(`${JSON.stringify(message)}\n`, (error) => {

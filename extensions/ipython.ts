@@ -9,12 +9,12 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { CellsView } from "./cells.ts";
-import { describeError, INTERRUPT_GRACE_MS, KernelRuntime, OUTPUT_CAPTURE_LIMIT_BYTES } from "./kernel-runtime.ts";
+import { describeError, INTERRUPT_GRACE_MS, KernelLostError, KernelRuntime, OUTPUT_CAPTURE_LIMIT_BYTES } from "./kernel-runtime.ts";
 import { CHECKPOINT_ENTRY_TYPE, createRuntime } from "./persistence.ts";
 
 const RESET_NOTICE = [
 	"<ipython_kernel_reset>",
-	"The IPython kernel was restarted. All in-memory variables, imports, tasks, and open resources from the previous kernel were lost; recreate them before continuing.",
+	"The IPython kernel stopped. All in-memory variables, imports, tasks, and open resources from the previous kernel were lost; recreate them before continuing.",
 	"</ipython_kernel_reset>",
 ].join("\n");
 
@@ -183,6 +183,7 @@ export default function ipythonExtension(pi: ExtensionAPI) {
 				notices = await checkpoints.sync(ctx.sessionManager.getBranch(), ctx.cwd, signal, progress);
 				execution = await kernel.execute(toolCallId, params.code, ctx.cwd, signal, progress, output);
 			} catch (error) {
+				if (error instanceof KernelLostError) forwarded.set(toolCallId, [RESET_NOTICE]);
 				transcript?.finish(`error: ${String(error)}`);
 				throw error;
 			} finally {

@@ -17,6 +17,14 @@ const manifestPath = (id) => join(cache, "pi-ipython", "checkpoints", "manifests
 // Longer than the tool's line limit, so the result keeps only the tail and saves the full output.
 const longOutput = (label) => Array.from({ length: 3000 }, (_, index) => `${label} ${index}\n`).join("");
 const printLong = (label) => `print(''.join(f'${label} {index}\\n' for index in range(3000)), end='')`;
+const alive = (pgid) => {
+	try {
+		process.kill(-pgid, 0);
+		return true;
+	} catch {
+		return false;
+	}
+};
 
 try {
 	// Editing a prompt returns to the state after the shared cells, not abandoned work.
@@ -139,6 +147,8 @@ try {
 	assert.match(raised.value[0].output, /ValueError: as data/);
 	assert.equal(raised.value[1].output, "2\n");
 	assert.equal(raised.isError, false);
+	for (const result of raised.value) assert.deepEqual(result.notices, []);
+	assert.doesNotMatch(raised.text, /ipython_kernel_reset/);
 
 	// Cancelling a running cell interrupts it and keeps the kernel state.
 	const interrupted = await extension.codemode(async (ipython) => {
@@ -152,7 +162,48 @@ try {
 	assert.equal(interrupted.value[0].status, "error");
 	assert.equal(interrupted.value[0].error.ename, "Interrupted");
 	assert.equal(interrupted.value[1].output, "1\n");
-	assert.deepEqual(interrupted.value[1].notices, []);
+	for (const result of interrupted.value) assert.deepEqual(result.notices, []);
+	assert.equal(interrupted.isError, false);
+	assert.doesNotMatch(interrupted.text, /ipython_kernel_reset/);
+
+	// The script reports kernel loss even if it catches the rejection or ends without another cell.
+	for (const caught of [true, false]) {
+		const processes = await extension.cell([
+			"import os, subprocess, sys",
+			"_child_code = \"import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); print('ready', flush=True); time.sleep(60)\"",
+			"_crash_child = subprocess.Popen([sys.executable, '-c', _child_code], stdout=subprocess.PIPE, text=True)",
+			"assert _crash_child.stdout.readline() == 'ready\\n'",
+			"print(os.getpgid(0), os.getpgid(_crash_child.pid))",
+		].join("\n"));
+		const [pgid, childPgid] = processes.structuredContent.output.trim().split(/\s+/).map(Number);
+		assert.ok(Number.isSafeInteger(pgid) && pgid > 1);
+		assert.equal(childPgid, pgid);
+		assert.equal(alive(pgid), true);
+		const stoppedScript = await extension.codemode(async (ipython) => {
+			const crash = ipython("import os; os._exit(17)");
+			if (caught) {
+				await assert.rejects(crash, /kernel state was lost/);
+				return { unrelated: 42 };
+			}
+			return crash;
+		});
+		assert.equal(stoppedScript.isError, !caught);
+		if (caught) assert.deepEqual(stoppedScript.value, { unrelated: 42 });
+		else assert.match(stoppedScript.text, /Script failed[\s\S]*kernel state was lost/);
+		// Cleanup must finish before another cell or shutdown can hide a leaked child.
+		await waitFor(() => !alive(pgid));
+		assert.equal(alive(pgid), false);
+		assert.match(stoppedScript.text, /<ipython_kernel_reset>[\s\S]*in-memory[\s\S]*lost[\s\S]*<\/ipython_kernel_reset>/);
+		assert.doesNotMatch(stoppedScript.text, /was restarted/);
+		const unrelated = await extension.codemode(() => "no cells");
+		assert.equal(unrelated.value, "no cells");
+		assert.equal(unrelated.isError, false);
+		assert.doesNotMatch(unrelated.text, /ipython_kernel_reset/);
+		const restored = await extension.cell("print(before_error)");
+		assert.equal(restored.structuredContent.output, "1\n");
+		assert.equal(restored.details.kernelReset, true);
+		assert.match(restored.text, /ipython_kernel_reset[\s\S]*ipython_state_restored/);
+	}
 
 	// A lost kernel rejects the call. The next cell reports the reset to the script, and the model sees it too.
 	const crashed = await extension.codemode(async (ipython) => {
