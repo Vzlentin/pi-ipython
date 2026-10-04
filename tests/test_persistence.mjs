@@ -41,6 +41,9 @@ async function ownerDeath(base, mode) {
 	const ready = join(hostRoot, "ready");
 	const idsPath = join(hostRoot, "ids.json");
 	const release = join(hostRoot, "release");
+	if (mode === "launch") {
+		writeFileSync(join(hostRoot, "sitecustomize.py"), "import time\ntime.sleep(60)\n");
+	}
 	const recordIds = `
 import os as _os, json as _json, pathlib as _pathlib
 _pathlib.Path(${JSON.stringify(idsPath)}).write_text(_json.dumps({
@@ -103,7 +106,10 @@ process.send('shutdown_started');
 await closing;
 `;
 	const host = spawn(process.execPath, ["--no-warnings", "--input-type=module", "--eval", hostCode], {
-		env: { ...process.env, XDG_CACHE_HOME: join(hostRoot, "cache") },
+		env: {
+			...process.env, XDG_CACHE_HOME: join(hostRoot, "cache"),
+			...(mode === "launch" ? { PYTHONPATH: hostRoot } : {}),
+		},
 		stdio: ["ignore", "pipe", "pipe", "ipc"],
 	});
 	let diagnostics = "";

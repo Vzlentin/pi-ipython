@@ -286,6 +286,8 @@ def main() -> int:
         # The gate prevents an untracked child from starting kernel code.
         manager.kernel_spec.argv = [
             sys.executable,
+            "-I",
+            "-S",
             "-c",
             _KERNEL_LAUNCH_GATE,
             str(gate_read),
