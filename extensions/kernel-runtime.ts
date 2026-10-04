@@ -337,6 +337,7 @@ export class KernelRuntime {
 				NO_COLOR: "1",
 				PYTHONUNBUFFERED: "1",
 				IPYTHON_KERNEL_CWD: cwd,
+				PI_IPYTHON_OWNER_PID: String(process.pid),
 			},
 			stdio: ["pipe", "pipe", "pipe"],
 		});

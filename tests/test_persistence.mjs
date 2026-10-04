@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
 	chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync,
@@ -6,10 +7,138 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import {
-	createExtensionHarness, createKernel, preserveEnvironment, runKernel,
+	createExtensionHarness, createKernel, preserveEnvironment, runKernel, waitFor,
 } from "./helpers.mjs";
+
+function delayedSerialization(ready, release) {
+	return `
+import pathlib as _pathlib, time as _time
+class DelayedSave:
+    def __reduce__(self):
+        _pathlib.Path(${JSON.stringify(ready)}).touch()
+        while not _pathlib.Path(${JSON.stringify(release)}).exists():
+            _time.sleep(0.025)
+        return (int, (42,))
+delayed = DelayedSave()`;
+}
+
+function processExists(id, group = false) {
+	try {
+		process.kill(group ? -id : id, 0);
+		return true;
+	} catch (error) {
+		if (error.code === "ESRCH") return false;
+		throw error;
+	}
+}
+
+async function ownerDeath(base, mode) {
+	const hostRoot = join(base, `owner-death-${mode}`);
+	mkdirSync(hostRoot);
+	const ready = join(hostRoot, "ready");
+	const idsPath = join(hostRoot, "ids.json");
+	const release = join(hostRoot, "release");
+	const recordIds = `
+import os as _os, json as _json, pathlib as _pathlib
+_pathlib.Path(${JSON.stringify(idsPath)}).write_text(_json.dumps({
+    'bridgePid': _os.getppid(), 'bridgePgid': _os.getpgid(_os.getppid()),
+    'kernelPid': _os.getpid(), 'kernelPgid': _os.getpgid(0),
+}))`;
+	const quietCell = `__import__('pathlib').Path(${JSON.stringify(ready)}).touch()\n__import__('time').sleep(60)`;
+	const code = mode === "checkpoint" ? delayedSerialization(ready, release) : quietCell;
+	const stalledCleanup = `
+import pathlib, runpy, time
+from jupyter_client import KernelManager
+def stalled_shutdown(self, **kwargs):
+    pathlib.Path(${JSON.stringify(ready)}).touch()
+    time.sleep(60)
+KernelManager.shutdown_kernel = stalled_shutdown
+runpy.run_path(${JSON.stringify(fileURLToPath(new URL("../extensions/bridge.py", import.meta.url)))}, run_name='__main__')`;
+	const stalledLaunch = `
+import json, os, pathlib, runpy, signal, time
+from jupyter_client.provisioning import local_provisioner
+original_launch = local_provisioner.launch_kernel
+def stalled_launch(*args, **kwargs):
+    process = original_launch(*args, **dict(kwargs, independent=True))
+    pathlib.Path(${JSON.stringify(idsPath)}).write_text(json.dumps({
+        'bridgePid': os.getpid(), 'bridgePgid': os.getpgid(0),
+        'kernelPid': process.pid, 'kernelPgid': os.getpgid(process.pid),
+    }))
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    pathlib.Path(${JSON.stringify(ready)}).touch()
+    time.sleep(60)
+    return process
+local_provisioner.launch_kernel = stalled_launch
+runpy.run_path(${JSON.stringify(fileURLToPath(new URL("../extensions/bridge.py", import.meta.url)))}, run_name='__main__')`;
+	const hostCode = ["cleanup", "launch"].includes(mode) ? `
+import { spawn } from 'node:child_process';
+const bridge = spawn(${JSON.stringify(fileURLToPath(new URL("../extensions/.python/bin/python", import.meta.url)))}, ['-I', '-c', ${JSON.stringify(mode === "launch" ? stalledLaunch : stalledCleanup)}], {
+    detached: true, cwd: ${JSON.stringify(hostRoot)},
+    env: { ...process.env, PI_IPYTHON_OWNER_PID: String(process.pid) },
+    stdio: ['pipe', 'ignore', 'inherit'],
+});
+bridge.stdin.end([
+    { type: 'startup', code: [] },
+    { type: 'execute', request_id: 'ids', code: ${JSON.stringify(recordIds)}, cwd: ${JSON.stringify(hostRoot)} },
+    { type: 'shutdown' },
+].map((message) => JSON.stringify(message) + '\\n').join(''));
+await new Promise((resolve) => bridge.on('exit', resolve));
+` : `
+import { SessionManager } from '@earendil-works/pi-coding-agent';
+import { createExtensionHarness, waitFor } from ${JSON.stringify(new URL("./helpers.mjs", import.meta.url).href)};
+import { existsSync } from 'node:fs';
+const root = ${JSON.stringify(hostRoot)};
+const harness = createExtensionHarness({
+    root, sessionManager: SessionManager.inMemory(root),
+    startup: (event) => { if (${JSON.stringify(mode)} === 'startup') event.startupCode.push(${JSON.stringify(`${recordIds}\n${quietCell}`)}); },
+});
+await harness.cell(${JSON.stringify(recordIds)});
+await harness.cell(${JSON.stringify(code)});
+await waitFor(() => existsSync(${JSON.stringify(ready)}));
+const closing = harness.shutdown();
+process.send('shutdown_started');
+await closing;
+`;
+	const host = spawn(process.execPath, ["--no-warnings", "--input-type=module", "--eval", hostCode], {
+		env: { ...process.env, XDG_CACHE_HOME: join(hostRoot, "cache") },
+		stdio: ["ignore", "pipe", "pipe", "ipc"],
+	});
+	let diagnostics = "";
+	let shutdownStarted = false;
+	let ids;
+	host.stdout.on("data", (chunk) => { diagnostics += chunk; });
+	host.stderr.on("data", (chunk) => { diagnostics += chunk; });
+	host.on("message", (message) => { shutdownStarted ||= message === "shutdown_started"; });
+	try {
+		await waitFor(() => {
+			assert.equal(host.exitCode, null, diagnostics);
+			assert.equal(host.signalCode, null, diagnostics);
+			return existsSync(ready) && (mode !== "checkpoint" || shutdownStarted);
+		}, 60_000);
+		ids = JSON.parse(readFileSync(idsPath, "utf8"));
+		for (const [name, id] of Object.entries(ids)) {
+			assert.ok(Number.isSafeInteger(id) && id > 1, name);
+			assert.ok(processExists(id, name.endsWith("Pgid")), name);
+		}
+		assert.notEqual(ids.bridgePgid, ids.kernelPgid);
+		const killedAt = performance.now();
+		assert.equal(host.kill("SIGKILL"), true);
+		await waitFor(() => Object.entries(ids).every(([name, id]) => !processExists(id, name.endsWith("Pgid"))), 5_000);
+		assert.ok(performance.now() - killedAt <= 5_000, `${mode}: owner-death cleanup exceeded five seconds`);
+	} finally {
+		// Emergency cleanup runs only after the disappearance assertion.
+		host.kill("SIGKILL");
+		if (!ids && existsSync(idsPath)) ids = JSON.parse(readFileSync(idsPath, "utf8"));
+		for (const pgid of [ids?.kernelPgid, ids?.bridgePgid]) {
+			if (pgid) {
+				try { process.kill(-pgid, "SIGKILL"); } catch {}
+			}
+		}
+	}
+}
 
 const root = realpathSync(mkdtempSync(join(tmpdir(), "pi-ipython-persistence-")));
 const restoreEnvironment = preserveEnvironment("XDG_CACHE_HOME", "PI_IPYTHON_PERSISTENCE");
@@ -24,6 +153,12 @@ const manager = SessionManager.inMemory(root);
 let extension = createExtensionHarness({ root, sessionManager: manager, startup });
 
 try {
+	const ownerDeathFailures = [];
+	for (const mode of ["cell", "checkpoint", "startup", "cleanup", "launch"]) {
+		try { await ownerDeath(root, mode); } catch (error) { ownerDeathFailures.push(new Error(mode, { cause: error })); }
+	}
+	if (ownerDeathFailures.length) throw new AggregateError(ownerDeathFailures, "owner-death cleanup failed");
+
 	// Functions, classes, modules, and ordinary values round-trip; resources and baseline names do not.
 	const setup = await extension.cell(`
 import functools, math as mm, socket
@@ -49,13 +184,24 @@ sock = socket.socket()
 startup_value = 0
 print('saved')`);
 	assert.match(setup.text, /saved/);
-	await extension.cell("print(value)"); // waits for and supersedes the first background save
-	await extension.shutdown("reload");
+	const saveReady = join(root, "save-ready");
+	const saveRelease = join(root, "save-release");
+	await extension.cell(`print(value)\n${delayedSerialization(saveReady, saveRelease)}`);
+	await waitFor(() => existsSync(saveReady));
+	let closed = false;
+	const closing = extension.shutdown("reload").then(() => { closed = true; });
+	try {
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(closed, false, "normal shutdown must wait for the pending checkpoint");
+	} finally {
+		writeFileSync(saveRelease, "release");
+	}
+	await closing;
 	extension = createExtensionHarness({ root, sessionManager: manager, startup });
 	const restored = await extension.cell(
-		"print(value, items[1]['answer'], mm.sqrt(16), box.answer(), locked(), recurse(5), closure(), next(iter(functions))(), partial(), startup_value, '_private' in globals(), 'handle' in globals(), 'sock' in globals())",
+		"print(value, items[1]['answer'], mm.sqrt(16), box.answer(), locked(), recurse(5), closure(), next(iter(functions))(), partial(), startup_value, '_private' in globals(), 'handle' in globals(), 'sock' in globals(), delayed)",
 	);
-	assert.match(restored.text, /41 42 4\.0 42 False 120 43 41 41 99 False False False/);
+	assert.match(restored.text, /41 42 4\.0 42 False 120 43 41 41 99 False False False 42/);
 	assert.match(restored.text, /ipython_state_restored/);
 	assert.match(restored.text, /generator .*live generator/i);
 	assert.match(restored.text, /handle .*live file resource/i);
@@ -227,4 +373,4 @@ print('saved')`);
 	restoreEnvironment();
 }
 
-console.log("persistence: round trips, dedup, GC, security, UUID validation, permissions and opt-out passed");
+console.log("persistence: owner-death cleanup, shutdown flush, round trips, dedup, GC, security, UUID validation, permissions and opt-out passed");
