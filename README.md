@@ -56,6 +56,8 @@ History is plain text, recorded from the first tool call after loading the exten
 
 Cancellation and output overflow first send SIGINT to the kernel process group. If the cell stops within 3 seconds, its partial output is returned as an error and kernel state is preserved. Otherwise the kernel and associated child work are killed. Top-level `await` is supported, including a signal-wakeup workaround for ipykernel 7.
 
+On macOS and Linux, the bridge and kernel exit within five seconds after their owning Pi process exits, including SIGKILL during a cell or checkpoint save. Normal shutdown allows up to ten seconds to flush pending checkpoints before stopping the kernel. An abrupt exit can lose an unfinished checkpoint.
+
 ## Codemode scripts
 
 In a `codemode` script, `tools.ipython` resolves to an object with `status`, `output`, `executionCount`, `error` (`ename` and `evalue`), `truncated`, `fullOutputPath`, and `notices`. A Python exception or an interrupted cell resolves with `status: "error"`, so the script can check it and keep going on the same kernel. The call rejects when the kernel is lost.

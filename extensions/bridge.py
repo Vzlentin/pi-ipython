@@ -18,6 +18,7 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 import traceback
 from collections.abc import Callable
 from pathlib import Path
@@ -28,6 +29,22 @@ from jupyter_client import KernelManager
 BRIDGE_PROTOCOL_VERSION = 2
 _OUTPUT_MESSAGE_CHARS = 16_384
 _SEND_LOCK = threading.Lock()
+_OWNER_LOCK = threading.Lock()
+_OWNER_DEAD = False
+_KERNEL_PGID: int | None = None
+_KERNEL_PROCESS: subprocess.Popen | None = None
+_KERNEL_LAUNCH_GATE = """
+import os, sys
+fd = int(sys.argv[1])
+try:
+    authorized = os.read(fd, 1) == b'\\x01'
+except OSError:
+    authorized = False
+os.close(fd)
+if not authorized:
+    sys.exit(0)
+os.execv(sys.executable, [sys.executable, *sys.argv[2:]])
+"""
 
 
 def send(message: dict[str, Any]) -> None:
@@ -40,6 +57,37 @@ def send(message: dict[str, Any]) -> None:
 def terminate_bridge(_signum: int, _frame: Any) -> None:
     """Let process termination unwind through main() so the kernel is reaped."""
     raise SystemExit(0)
+
+
+def kill_kernel_group() -> None:
+    with _OWNER_LOCK:
+        pgid, process = _KERNEL_PGID, _KERNEL_PROCESS
+    if pgid is not None:
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    if process is not None:
+        try:
+            process.wait(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            pass
+
+
+def monitor_owner(owner_pid: int) -> None:
+    global _OWNER_DEAD
+    while os.getppid() == owner_pid:
+        time.sleep(0.1)
+
+    with _OWNER_LOCK:
+        _OWNER_DEAD = True
+    os.kill(os.getpid(), signal.SIGTERM)
+    time.sleep(3.0)
+    try:
+        kill_kernel_group()
+    finally:
+        # Cleanup and protocol writes can both block after the owner exits.
+        os._exit(0)
 
 
 def parent_id(message: dict[str, Any]) -> str | None:
@@ -222,31 +270,51 @@ def execute(client: Any, manager: KernelManager, request_id: str, code: str, cwd
 
 
 def main() -> int:
+    global _KERNEL_PGID, _KERNEL_PROCESS
     signal.signal(signal.SIGTERM, terminate_bridge)
     cwd = os.environ.get("IPYTHON_KERNEL_CWD") or os.getcwd()
+    owner_pid = int(os.environ["PI_IPYTHON_OWNER_PID"])
     manager = KernelManager(kernel_name="python3")
-    # Keep bridge and kernel on the extension-owned Python runtime.
-    manager.kernel_spec.argv = [
-        sys.executable,
-        "-m",
-        "ipykernel_launcher",
-        "-f",
-        "{connection_file}",
-    ]
+    gate_read, gate_write = os.pipe()
     client: Any | None = None
     exit_code = 0
     cleanup_errors: list[BaseException] = []
 
     try:
+        threading.Thread(target=monitor_owner, args=(owner_pid,), daemon=True).start()
+        # Keep bridge and kernel on the extension-owned Python runtime.
+        # The gate prevents an untracked child from starting kernel code.
+        manager.kernel_spec.argv = [
+            sys.executable,
+            "-I",
+            "-S",
+            "-c",
+            _KERNEL_LAUNCH_GATE,
+            str(gate_read),
+            "-m",
+            "ipykernel_launcher",
+            "-f",
+            "{connection_file}",
+        ]
+        if os.getppid() != owner_pid:
+            return 0
         manager.start_kernel(
             cwd=cwd,
             env=dict(os.environ, NO_COLOR="1"),
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            close_fds=True,
+            pass_fds=(gate_read,),
         )
         kernel_pgid = getattr(manager.provisioner, "pgid", None)
         if not isinstance(kernel_pgid, int) or kernel_pgid <= 1:
             raise RuntimeError("Jupyter did not report a valid kernel process group")
+        with _OWNER_LOCK:
+            _KERNEL_PGID = kernel_pgid
+            _KERNEL_PROCESS = getattr(manager.provisioner, "process", None)
+            if _OWNER_DEAD or os.getppid() != owner_pid:
+                raise SystemExit(0)
+            os.write(gate_write, b"\x01")
         send({"type": "kernel_started", "kernel_pgid": kernel_pgid})
         client = manager.client()
         client.start_channels()
@@ -307,6 +375,12 @@ def main() -> int:
         send({"type": "fatal", "error": str(error), "traceback": traceback.format_exc()})
         exit_code = 1
     finally:
+        # A termination signal must not interrupt cleanup already in progress.
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        os.close(gate_write)
+        os.close(gate_read)
+        if os.getppid() != owner_pid:
+            kill_kernel_group()
         if client is not None:
             try:
                 client.stop_channels()
@@ -317,6 +391,8 @@ def main() -> int:
                 manager.shutdown_kernel(now=True)
         except BaseException as error:
             cleanup_errors.append(error)
+        if os.getppid() != owner_pid:
+            kill_kernel_group()
 
     if cleanup_errors:
         details = "\n".join("".join(traceback.format_exception(error)) for error in cleanup_errors)
