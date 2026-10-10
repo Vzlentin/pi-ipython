@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
@@ -23,10 +23,25 @@ const models = createModels();
 models.setProvider(faux.provider);
 const store = join(root, "session.sqlite");
 let turns = 0;
+/** `[event name, conversation ID]` for every ipython event on the host bus, in order. */
+const seen = [];
+/** When set, the next cell-start listener commits a task-owned conversation and then writes this file. */
+let commitMarker;
 
 /** A host process: a Harness over the store, with the ipython extension installed from its pi-durable entry. */
 async function openHost() {
-	const tool = ipython({ durable, ai, events: new EventEmitter() });
+	const events = new EventEmitter();
+	for (const name of ["ipython:cell-start", "ipython:cell-end", "ipython:kernel-starting"]) {
+		events.on(name, (data) => seen.push([name, String(data.conversationId)]));
+	}
+	events.on("ipython:cell-start", ({ api, context }) => {
+		const marker = commitMarker;
+		if (marker === undefined) return;
+		commitMarker = undefined;
+		api.commit((tx) => tx.createConversation({ ownership: { kind: "task", taskId: api.taskId } }), context)
+			.then(() => writeFileSync(marker, ""), (error) => console.error("commit from cell-start failed:", error));
+	});
+	const tool = ipython({ durable, ai, events });
 	const registry = durable.createRegistry();
 	for (const extension of tool.extensions) registry.install(extension);
 	const harness = await durable.Harness.open(await openNodeSqliteStorage(store), { models, registry }, context);
@@ -41,6 +56,11 @@ async function openHost() {
 			}
 		},
 	};
+}
+
+/** The events of one turn, which must be exactly a start and an end for `id`. */
+function assertPaired(from, id) {
+	assert.deepEqual(seen.slice(from), [["ipython:cell-start", id], ["ipython:cell-end", id]]);
 }
 
 /** One model turn that runs `code` as an ipython call; returns the call's result as the model saw it. */
@@ -64,22 +84,41 @@ async function cell(conversation, code) {
 try {
 	let host = await openHost();
 	try {
+		const id = String(host.conversation.id);
+		let from = seen.length;
 		const first = await cell(host.conversation, "x = 41");
 		assert.equal(first.isError, false, first.text);
+		assert.deepEqual(seen.slice(from), [
+			["ipython:cell-start", id],
+			["ipython:kernel-starting", id],
+			["ipython:cell-end", id],
+		], "cell-start comes before the kernel exists, and kernel-starting names the conversation");
 
-		const reuse = await cell(host.conversation, "print(x + 1)");
+		const marker = join(root, "committed");
+		commitMarker = marker;
+		from = seen.length;
+		const poll = `import os, time\nfor _ in range(500):\n    if os.path.exists(${JSON.stringify(marker)}): break\n    time.sleep(0.01)\nprint(x + 1)\nprint(os.path.exists(${JSON.stringify(marker)}))`;
+		const reuse = await cell(host.conversation, poll);
 		assert.match(reuse.text, /^42$/m, "state carries across cells of one conversation");
 		assert.doesNotMatch(reuse.text, /ipython_state_restored/, "a live kernel on the same branch needs no restore");
+		assert.match(reuse.text, /^True$/m, "the api from cell-start commits a task-owned conversation while the cell runs");
+		assertPaired(from, id);
 
+		from = seen.length;
 		const exception = await cell(host.conversation, "raise ValueError('bad input')");
 		assert.equal(exception.isError, true);
 		assert.match(exception.text, /ValueError/);
+		assertPaired(from, id);
 
+		from = seen.length;
 		const crash = await cell(host.conversation, "import os; os._exit(17)");
 		assert.equal(crash.isError, true, "a lost kernel is an error result");
 		assert.match(crash.text, /kernel state was lost/);
+		assertPaired(from, id);
 
+		from = seen.length;
 		const recovered = await cell(host.conversation, "print(x)");
+		assert.ok(seen.slice(from).some((event) => event[0] === "ipython:kernel-starting" && event[1] === id), "the restarted kernel names the conversation");
 		assert.equal(recovered.isError, false, recovered.text);
 		assert.match(recovered.text, /<ipython_kernel_reset>/, "the next cell reports the lost kernel");
 		assert.match(recovered.text, /<ipython_state_restored>/, "the next cell restores the checkpoint");
@@ -99,7 +138,13 @@ try {
 		const before = await cell(host.conversation, "x = 7");
 		await cell(host.conversation, "x = 8");
 		const fork = await host.conversation.fork(before.entryId, { ownership: { kind: "ownerless" } }, context);
+		const from = seen.length;
 		const forked = await cell(fork, "print(x)");
+		assert.deepEqual(seen.slice(from), [
+			["ipython:cell-start", String(fork.id)],
+			["ipython:kernel-starting", String(fork.id)],
+			["ipython:cell-end", String(fork.id)],
+		], "a fork's kernel names the fork");
 		assert.match(forked.text, /<ipython_state_restored>/, "a fork restores its own history");
 		assert.match(forked.text, /^7$/m, "the fork sees the state at its fork entry");
 
@@ -118,7 +163,7 @@ try {
 		await host.close();
 	}
 
-	console.log("durable: cells, exceptions, kernel crash, reopened store, forks and long output passed");
+	console.log("durable: cells, exceptions, kernel crash, host bus events, reopened store, forks and long output passed");
 } finally {
 	restoreEnvironment();
 	rmSync(root, { recursive: true, force: true });
