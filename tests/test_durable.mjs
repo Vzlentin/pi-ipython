@@ -27,6 +27,18 @@ let turns = 0;
 const seen = [];
 /** When set, the next cell-start listener commits a task-owned conversation and then writes this file. */
 let commitMarker;
+/** The result of the last ipython call that the `caller` tool made through `executeTool`. */
+let nested;
+
+const caller = durable.defineTool({
+	name: "caller",
+	description: "Runs code through the ipython tool",
+	parameters: ai.Type.Object({ code: ai.Type.String() }),
+	async execute(args, api, context) {
+		nested = await api.executeTool("ipython", { code: args.code }, context);
+		return { output: [{ type: "text", text: "called" }] };
+	},
+});
 
 /** A host process: a Harness over the store, with the ipython extension installed from its pi-durable entry. */
 async function openHost() {
@@ -44,6 +56,7 @@ async function openHost() {
 	const tool = ipython({ durable, ai, events });
 	const registry = durable.createRegistry();
 	for (const extension of tool.extensions) registry.install(extension);
+	registry.install(durable.defineExtension({ name: "caller", tools: [caller] }));
 	const harness = await durable.Harness.open(await openNodeSqliteStorage(store), { models, registry }, context);
 	const conversation = await harness.root(context, { agent: { model: { provider: "faux", modelId: "model" }, cwd: root } });
 	return {
@@ -63,10 +76,10 @@ function assertPaired(from, id) {
 	assert.deepEqual(seen.slice(from), [["ipython:cell-start", id], ["ipython:cell-end", id]]);
 }
 
-/** One model turn that runs `code` as an ipython call; returns the call's result as the model saw it. */
-async function cell(conversation, code) {
+/** One model turn that runs `code` as a call of `tool`; returns the call's result as the model saw it. */
+async function cell(conversation, code, tool = "ipython") {
 	faux.setResponses([
-		fauxAssistantMessage(fauxToolCall("ipython", { code }), { stopReason: "toolUse" }),
+		fauxAssistantMessage(fauxToolCall(tool, { code }), { stopReason: "toolUse" }),
 		fauxAssistantMessage("done"),
 	]);
 	turns += 1;
@@ -159,11 +172,21 @@ try {
 		assert.ok(saved, "a diagnostic names the file with the full output");
 		assert.equal(readFileSync(saved[1], "utf8").trimEnd().split("\n").length, 3000);
 		assert.doesNotMatch(long.text, /Output truncated to its end/, "the harness does not cut the tail again");
+
+		await cell(host.conversation, "print(6 * 7)", "caller");
+		assert.equal(nested.isError, false, JSON.stringify(nested));
+		assert.equal(nested.structuredOutput.status, "ok");
+		assert.equal(nested.structuredOutput.output, "42\n", "a tool gets the CellResult of a nested cell");
+
+		await cell(host.conversation, "raise ValueError('bad')", "caller");
+		assert.equal(nested.isError, true, JSON.stringify(nested));
+		assert.equal(nested.structuredOutput.status, "error");
+		assert.equal(nested.structuredOutput.error.ename, "ValueError", "a nested exception is data in the CellResult");
 	} finally {
 		await host.close();
 	}
 
-	console.log("durable: cells, exceptions, kernel crash, host bus events, reopened store, forks and long output passed");
+	console.log("durable: cells, exceptions, kernel crash, host bus events, reopened store, forks, long output and nested calls passed");
 } finally {
 	restoreEnvironment();
 	rmSync(root, { recursive: true, force: true });
