@@ -42,6 +42,15 @@ values can be filled in by a promise passed to `waitFor`. A failing startup
 snippet fails the kernel start. The variables reach the kernel, not Pi's own
 process.
 
+In pi-durable hosts only, the event also has `conversationId`, the conversation that owns the kernel. Each cell
+also emits two events on the host's bus:
+
+- `ipython:cell-start` with `{ conversationId, api, context }`, before the cell runs. `api` and `context` are the
+  `ipython` call's, so a listener can use `api.commit(..., context)` while the cell runs, for example to create a
+  conversation owned by `api.taskId`.
+- `ipython:cell-end` with `{ conversationId }`, after the cell ends, also when it raises, is cancelled or loses its
+  kernel.
+
 ## Cells in Herdr
 
 In interactive Pi inside Herdr, use `/cells` or `Ctrl+Shift+I` to toggle an IPython console on the right, attached to the same kernel. It first prints the recorded history (code, output, progress, errors, and reset notices), then mirrors each new cell live as Pi runs it. Type at its prompt to inspect the kernel, for example `%whos`, `%history -o`, or a variable name. Cells run while the console is closed remain in the history. Your focus stays in Pi. Repeat `/cells` to close it.
@@ -131,6 +140,8 @@ await tool.close();
   a crash, restores the latest checkpoint of its own history, with the same notices as in Pi.
 - The content of a result is the output tail. Kernel resets, checkpoint restores and the line that names the file
   with the full output are diagnostics, which the harness shows after it.
+- The kernel-starting event names the conversation, and each cell emits `ipython:cell-start` and `ipython:cell-end`.
+  See [Extending the kernel](#extending-the-kernel).
 - There is no `/cells` console. Results have no structured output, because pi-durable 1.1.0 tools have none.
 
 ## Security

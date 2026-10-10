@@ -11,7 +11,7 @@ import type * as Ai from "@earendil-works/pi-ai";
 import type * as Durable from "@earendil-works/pi-durable";
 import type { ConversationId, Cursor, Tx } from "@earendil-works/pi-durable";
 import { cellResult, DESCRIPTION } from "../extensions/cell.ts";
-import { describeError, type KernelHost } from "../extensions/kernel-runtime.ts";
+import { describeError, KERNEL_STARTING_EVENT, type KernelHost } from "../extensions/kernel-runtime.ts";
 import { OUTPUT_MAX_BYTES, OUTPUT_MAX_LINES } from "../extensions/output.ts";
 import { createRuntime, type Runtime } from "../extensions/persistence.ts";
 
@@ -55,35 +55,47 @@ export default function ipython({ durable, ai, events }: DurableHost) {
 			const signal = context.abortSignal;
 			const { cwd = process.cwd() } = await api.agent(context);
 			if (closing) throw new Error("IPython runtime is shutting down");
-			const key = String(api.conversationId);
-			let runtime = runtimes.get(key);
-			if (!runtime) runtimes.set(key, runtime = createRuntime({ events }, cwd));
-			const { kernel, checkpoints } = runtime;
+			const { conversationId } = api;
+			const key = String(conversationId);
+			events.emit("ipython:cell-start", { conversationId, api, context });
+			try {
+				let runtime = runtimes.get(key);
+				if (!runtime) {
+					const emit = (name: string, data: unknown) => {
+						if (name === KERNEL_STARTING_EVENT) Object.assign(data as object, { conversationId });
+						return events.emit(name, data);
+					};
+					runtimes.set(key, runtime = createRuntime({ events: { emit } }, cwd));
+				}
+				const { kernel, checkpoints } = runtime;
 
-			const candidates = await api.commit((tx) => checkpointIds(tx, api.conversationId), context);
-			const notices = await checkpoints.sync(candidates, cwd, signal, () => {});
-			let streamed = "";
-			const execution = await kernel.execute(api.callId, args.code, cwd, signal, () => {}, (output) => {
-				// Running output for viewers. api.output only appends, so after a clear they see the old output, then the new.
-				api.output(output.startsWith(streamed) ? output.slice(streamed.length) : output);
-				streamed = output;
-			});
-			const checkpoint = checkpoints.save();
-			if (checkpoint !== undefined) {
-				await api.commit((tx) => tx.appendEntry(CheckpointEntry, api.conversationId, { data: { checkpoint } }), context);
+				const candidates = await api.commit((tx) => checkpointIds(tx, api.conversationId), context);
+				const notices = await checkpoints.sync(candidates, cwd, signal, () => {});
+				let streamed = "";
+				const execution = await kernel.execute(api.callId, args.code, cwd, signal, () => {}, (output) => {
+					// Running output for viewers. api.output only appends, so after a clear they see the old output, then the new.
+					api.output(output.startsWith(streamed) ? output.slice(streamed.length) : output);
+					streamed = output;
+				});
+				const checkpoint = checkpoints.save();
+				if (checkpoint !== undefined) {
+					await api.commit((tx) => tx.appendEntry(CheckpointEntry, api.conversationId, { data: { checkpoint } }), context);
+				}
+
+				// Resets, restores and the truncation line are remarks for the model, which the harness renders after the output.
+				const { data, header } = cellResult(execution, notices, (text) => kernel.saveOutput(text));
+				const diagnostics: Durable.ToolDiagnostic[] = data.notices.map((message) => ({ severity: "info", message }));
+				if (header) diagnostics.push({ severity: "info", code: "output_truncated", message: header });
+				const text = data.output || (data.status === "error" && describeError(execution.result.error)) || "[no output]";
+				return {
+					content: [{ type: "text", text }],
+					details: { status: data.status, kernelReset: execution.kernelReset, truncated: data.truncated },
+					diagnostics,
+					isError: data.status === "error",
+				};
+			} finally {
+				events.emit("ipython:cell-end", { conversationId });
 			}
-
-			// Resets, restores and the truncation line are remarks for the model, which the harness renders after the output.
-			const { data, header } = cellResult(execution, notices, (text) => kernel.saveOutput(text));
-			const diagnostics: Durable.ToolDiagnostic[] = data.notices.map((message) => ({ severity: "info", message }));
-			if (header) diagnostics.push({ severity: "info", code: "output_truncated", message: header });
-			const text = data.output || (data.status === "error" && describeError(execution.result.error)) || "[no output]";
-			return {
-				content: [{ type: "text", text }],
-				details: { status: data.status, kernelReset: execution.kernelReset, truncated: data.truncated },
-				diagnostics,
-				isError: data.status === "error",
-			};
 		},
 	});
 
