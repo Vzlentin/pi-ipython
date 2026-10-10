@@ -138,11 +138,13 @@ await tool.close();
 - Each conversation gets its own kernel, in the conversation's working directory.
 - A cell's checkpoint ID is a `pi-ipython.checkpoint` entry of its conversation. A fork, or a store reopened after
   a crash, restores the latest checkpoint of its own history, with the same notices as in Pi.
-- The content of a result is the output tail. Kernel resets, checkpoint restores and the line that names the file
+- The output of a result is the output tail. Kernel resets, checkpoint restores and the line that names the file
   with the full output are diagnostics, which the harness shows after it.
 - The kernel-starting event names the conversation, and each cell emits `ipython:cell-start` and `ipython:cell-end`.
   See [Extending the kernel](#extending-the-kernel).
-- There is no `/cells` console. Results have no structured output, because pi-durable 1.1.0 tools have none.
+- Results have structured output: the `CellResult`, as in Pi. A tool that runs a cell through `api.executeTool`
+  gets it as `structuredOutput`.
+- There is no `/cells` console.
 
 ## Security
 

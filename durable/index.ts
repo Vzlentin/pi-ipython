@@ -49,7 +49,21 @@ export default function ipython({ durable, ai, events }: DurableHost) {
 		description: DESCRIPTION,
 		parameters: ai.Type.Object({ code: ai.Type.String({ description: "Python or an IPython cell" }) }),
 		executionMode: "sequential",
-		// The content is the output tail, already within these limits, so the harness never cuts it again.
+		// Keep equal to `outputSchema` in extensions/ipython.ts; this module cannot import it.
+		structuredOutputSchema: ai.Type.Object({
+			status: ai.Type.Union([ai.Type.Literal("ok"), ai.Type.Literal("error")], {
+				description: "\"error\" when the cell raised or was interrupted",
+			}),
+			output: ai.Type.String({ description: "Streams, display output and tracebacks, without ANSI codes" }),
+			executionCount: ai.Type.Optional(ai.Type.Number()),
+			error: ai.Type.Optional(ai.Type.Object({ ename: ai.Type.String(), evalue: ai.Type.String() })),
+			truncated: ai.Type.Boolean({ description: "Only the tail of the output is kept" }),
+			fullOutputPath: ai.Type.Optional(ai.Type.String()),
+			notices: ai.Type.Array(ai.Type.String(), {
+				description: "Kernel restarts and checkpoint restores that happened before the cell ran",
+			}),
+		}),
+		// The returned output is the cell's output tail, already within these limits, so the harness never cuts it again.
 		outputLimits: { maxLines: OUTPUT_MAX_LINES, maxBytes: OUTPUT_MAX_BYTES, retain: "tail" },
 		async execute(args, api, context) {
 			const signal = context.abortSignal;
@@ -88,7 +102,8 @@ export default function ipython({ durable, ai, events }: DurableHost) {
 				if (header) diagnostics.push({ severity: "info", code: "output_truncated", message: header });
 				const text = data.output || (data.status === "error" && describeError(execution.result.error)) || "[no output]";
 				return {
-					content: [{ type: "text", text }],
+					output: [{ type: "text", text }],
+					structuredOutput: data,
 					details: { status: data.status, kernelReset: execution.kernelReset, truncated: data.truncated },
 					diagnostics,
 					isError: data.status === "error",
