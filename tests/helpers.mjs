@@ -40,7 +40,6 @@ export function createKernel(startup, startupCode) {
 	if (startup) bus.on("ipython:kernel-starting", startup);
 	return new KernelRuntime({
 		events: { emit: (name, data) => bus.emit(name, data) },
-		exec: execShim,
 	}, startupCode);
 }
 

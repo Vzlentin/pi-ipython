@@ -1,4 +1,5 @@
 - Read `extensions/kernel-runtime.ts` and `extensions/bridge.py` together before changing runtime behavior. They are the Node and Python halves of the same stdio protocol; keep message shapes and `BRIDGE_PROTOCOL_VERSION` synchronized.
+- `durable/` is the pi-durable adapter, loaded by hosts outside Pi. Import pi-durable, pi-ai and chord there as types only; the host passes the modules in. The core it shares (`kernel-runtime.ts`, `persistence.ts`, `cell.ts`, `output.ts`) must not import Pi packages at run time either. `output.ts` copies Pi's tail truncation for that reason; keep it equal to pi-coding-agent's `truncateTail`.
 - This package has no RLM support and must not import librlm. RLM lives in pi-rlm, which uses the `ipython:kernel-starting` event. Keep that payload's contract (`env`, `startupCode`, `waitFor`) stable.
 - No tautological tests. Assert externally observable behavior and failure recovery; do not assert source layout, method names, import spellings, or compiler success as runtime tests.
 - Keep the kernelspec override in `extensions/bridge.py`. It ensures the bridge and kernel use the same Python runtime.

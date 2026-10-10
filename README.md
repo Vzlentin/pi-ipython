@@ -3,14 +3,15 @@
 A Pi package providing one `ipython` tool (a single `code` parameter) backed by a
 persistent, extension-owned Jupyter/IPython kernel, with top-level `await` and
 native IPython magics. It has no RLM support of its own;
-[pi-rlm](https://github.com/Vzlentin/pi-rlm) adds it on top.
+[pi-rlm](https://github.com/Vzlentin/pi-rlm) adds it on top. The same tool also
+runs in hosts built on pi-durable, see [pi-durable](#pi-durable).
 
 ## Install
 
 Requirements:
 
 - macOS or Linux, with Bash and `lockf` (macOS) or `flock` (Linux).
-- Node.js 22.19 or newer, npm, Git, and Pi (tested with 1.0.0).
+- Node.js 22.19 or newer, npm, Git, and Pi (tested with 1.1.0).
 - `uv` on `PATH`. The first tool call provisions an extension-owned Python 3.12
   runtime with ipykernel, jupyter-client, and cloudpickle in `extensions/.python`,
   so it needs network access.
@@ -25,7 +26,8 @@ For development, from a clone: `npm install`, `npm test`, then run
 ## Extending the kernel
 
 Before every kernel start (including restarts), the extension emits
-`ipython:kernel-starting` on `pi.events` with a mutable payload:
+`ipython:kernel-starting` on `pi.events` with a mutable payload. In a pi-durable
+host it goes to the event bus the host passes in:
 
 ```ts
 interface KernelStartingEvent {
@@ -100,6 +102,37 @@ Opt-out leaves existing cache data untouched and otherwise restores the extensio
 
 **Checkpoint security:** pickles can execute code and may contain sensitive data. Store directories are `0700`, files are `0600`, and symlinks, unowned paths, non-private paths, and malformed checkpoint IDs are refused. Do not place untrusted files in the checkpoint cache or share it with another user.
 
+## pi-durable
+
+Hosts that run agents on [pi-durable](https://www.npmjs.com/package/@earendil-works/pi-durable), such as
+[workflows](https://github.com/Vzlentin/workflows), get the same `ipython` tool from `durable/index.ts`. The
+package declares it in its own field, which Pi does not read:
+
+```json
+"piDurable": { "extensions": ["./durable/index.ts"] }
+```
+
+The default export takes the host's pi-durable and pi-ai modules and its event bus. It imports neither module at
+run time, so the host's copies are the only ones.
+
+```ts
+import * as ai from "@earendil-works/pi-ai";
+import * as durable from "@earendil-works/pi-durable";
+import ipython from "pi-ipython/durable/index.ts";
+
+const tool = ipython({ durable, ai, events });
+for (const extension of tool.extensions) registry.install(extension);
+// When the host stops: waits for pending checkpoints, then stops every kernel.
+await tool.close();
+```
+
+- Each conversation gets its own kernel, in the conversation's working directory.
+- A cell's checkpoint ID is a `pi-ipython.checkpoint` entry of its conversation. A fork, or a store reopened after
+  a crash, restores the latest checkpoint of its own history, with the same notices as in Pi.
+- The content of a result is the output tail. Kernel resets, checkpoint restores and the line that names the file
+  with the full output are diagnostics, which the harness shows after it.
+- There is no `/cells` console. Results have no structured output, because pi-durable 1.1.0 tools have none.
+
 ## Security
 
 The kernel is not sandboxed. Code runs with your user permissions and can access local files, environment variables, and the network. The separate Python runtime isolates dependencies, not system access.
@@ -110,7 +143,7 @@ The kernel is not sandboxed. Code runs with your user permissions and can access
 npm test
 ```
 
-Model-free: typechecking and real kernels for state, working directory, synchronous and asynchronous interruption, overflow capture, reset cleanup, the startup hook, and the Herdr console. See [tests/README.md](tests/README.md).
+Model-free: typechecking and real kernels for state, working directory, synchronous and asynchronous interruption, overflow capture, reset cleanup, the startup hook, the Herdr console, and the pi-durable tool with a faux model. See [tests/README.md](tests/README.md).
 
 ## License
 

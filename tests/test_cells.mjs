@@ -315,17 +315,7 @@ try {
 
 if (process.argv.includes("--kernel")) {
 	process.env.HERDR_ENV = "1";
-	const exec = promisify(execFile);
-	const kernel = new KernelRuntime({
-		events: { emit() {} },
-		async exec(command, args, options) {
-			try {
-				return { ...await exec(command, args, options), code: 0 };
-			} catch (error) {
-				return { code: error.code ?? 1, stderr: error.stderr ?? error.message, stdout: error.stdout ?? "" };
-			}
-		},
-	});
+	const kernel = new KernelRuntime({ events: { emit() {} } });
 	const view = new CellsView(pi);
 	const config = { cwd: process.cwd() };
 	let recoveredConnection;

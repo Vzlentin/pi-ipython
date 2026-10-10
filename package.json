@@ -15,23 +15,44 @@
     "typecheck": "tsc -p tsconfig.json",
     "test:kernel": "node --no-warnings tests/test_kernel.mjs && node --no-warnings tests/test_cells.mjs --kernel",
     "test:persistence": "node --no-warnings tests/test_persistence.mjs && node --no-warnings tests/test_branches.mjs && node --no-warnings tests/test_checkpoint_limits.mjs",
-    "test": "npm run typecheck && npm run test:kernel && npm run test:persistence"
+    "test:output": "node --no-warnings tests/test_output.mjs",
+    "test:durable": "node --no-warnings tests/test_durable.mjs",
+    "test": "npm run typecheck && npm run test:output && npm run test:kernel && npm run test:persistence && npm run test:durable"
   },
   "pi": {
     "extensions": [
       "./extensions/ipython.ts"
     ]
   },
+  "piDurable": {
+    "extensions": [
+      "./durable/index.ts"
+    ]
+  },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-durable": "*",
     "typebox": "*"
   },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    },
+    "@earendil-works/pi-durable": {
+      "optional": true
+    },
+    "typebox": {
+      "optional": true
+    }
+  },
   "devDependencies": {
-    "@earendil-works/pi-ai": "1.0.0",
-    "@earendil-works/pi-coding-agent": "1.0.0",
+    "@earendil-works/chord": "1.1.0",
+    "@earendil-works/pi-ai": "1.1.0",
+    "@earendil-works/pi-coding-agent": "1.1.0",
+    "@earendil-works/pi-durable": "1.1.0",
     "@types/node": "22.19.7",
-    "typebox": "1.3.7",
+    "typebox": "1.3.27",
     "typescript": "5.9.3"
   },
   "license": "MIT"
