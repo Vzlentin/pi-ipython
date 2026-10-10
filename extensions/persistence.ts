@@ -2,8 +2,7 @@ import { randomUUID } from "node:crypto";
 import { lstatSync, mkdirSync, readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import type { ExtensionAPI, SessionEntry } from "@earendil-works/pi-coding-agent";
-import { errorText, KernelRuntime } from "./kernel-runtime.ts";
+import { errorText, type KernelHost, KernelRuntime } from "./kernel-runtime.ts";
 
 const RESTORE_TIMEOUT_MS = 10_000;
 const SAVE_TIMEOUT_MS = 60_000;
@@ -62,34 +61,33 @@ function checkpointBase(): string {
 	return realpathSync(base);
 }
 
-/** Creates the kernel and its checkpoints, enabled unless `cwd` opts out. */
-export function createRuntime(pi: ExtensionAPI, cwd: string): { kernel: KernelRuntime; checkpoints: Checkpoints } {
-	if (!persistenceEnabled(cwd)) {
-		const kernel = new KernelRuntime(pi);
-		return { kernel, checkpoints: new Checkpoints(kernel, false) };
-	}
-	// Runs after all other startup code, so names supplied by extensions are never checkpointed.
-	const initialize = `__import__('pi_ipython_state').initialize(get_ipython(), ${JSON.stringify(checkpointBase())})`;
-	const kernel = new KernelRuntime(pi, [initialize]);
-	return { kernel, checkpoints: new Checkpoints(kernel, true) };
+export interface Runtime {
+	kernel: KernelRuntime;
+	checkpoints: Checkpoints;
+	/** Waits for pending checkpoints, then stops the kernel. */
+	close(): Promise<void>;
 }
 
-/** Custom entry type for checkpoints of cells that another tool ran, since Pi does not save their results. */
-export const CHECKPOINT_ENTRY_TYPE = "ipython-checkpoint";
-
-function checkpointIds(branch: SessionEntry[]): string[] {
-	const ids: string[] = [];
-	for (let index = branch.length - 1; index >= 0; index -= 1) {
-		const entry = branch[index];
-		let checkpoint: unknown;
-		if (entry.type === "custom" && entry.customType === CHECKPOINT_ENTRY_TYPE) {
-			checkpoint = (entry.data as { checkpoint?: unknown } | undefined)?.checkpoint;
-		} else if (entry.type === "message" && entry.message.role === "toolResult" && entry.message.toolName === "ipython") {
-			checkpoint = (entry.message.details as { checkpoint?: unknown } | undefined)?.checkpoint;
-		}
-		if (typeof checkpoint === "string") ids.push(checkpoint);
-	}
-	return ids;
+/** Creates the kernel and its checkpoints, enabled unless `cwd` opts out. */
+export function createRuntime(host: KernelHost, cwd: string): Runtime {
+	const enabled = persistenceEnabled(cwd);
+	// Runs after all other startup code, so names supplied by extensions are never checkpointed.
+	const startupCode = enabled
+		? [`__import__('pi_ipython_state').initialize(get_ipython(), ${JSON.stringify(checkpointBase())})`]
+		: [];
+	const kernel = new KernelRuntime(host, startupCode);
+	const checkpoints = new Checkpoints(kernel, enabled);
+	return {
+		kernel,
+		checkpoints,
+		async close() {
+			try {
+				await checkpoints.close();
+			} finally {
+				await kernel.shutdown();
+			}
+		},
+	};
 }
 
 function restoreNotice(summary: RestoreSummary): string {
@@ -130,16 +128,19 @@ export class Checkpoints {
 		this.enabled = enabled;
 	}
 
-	/** Starts the kernel and restores the branch's state. Returns notices for the next result. */
+	/**
+	 * Starts the kernel and restores the branch's state. `candidates` are the checkpoint IDs on the branch, newest first.
+	 * Returns notices for the next result.
+	 */
 	sync(
-		branch: SessionEntry[],
+		candidates: string[],
 		cwd: string,
 		signal: AbortSignal | undefined,
 		onProgress: (message: string) => void,
 	): Promise<string[]> {
 		if (!this.enabled) return Promise.resolve([]);
 		// Serialized with saves and other syncs; the kernel refuses overlapping requests as busy.
-		const run = this.pending.then(() => this.restoreBranch(checkpointIds(branch), cwd, signal, onProgress));
+		const run = this.pending.then(() => this.restoreBranch(candidates, cwd, signal, onProgress));
 		this.pending = run.then(() => {}, () => {});
 		return run;
 	}

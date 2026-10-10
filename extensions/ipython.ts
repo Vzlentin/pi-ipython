@@ -1,31 +1,32 @@
-import type { JsonObject } from "@earendil-works/pi-ai";
-import {
-	DEFAULT_MAX_BYTES,
-	DEFAULT_MAX_LINES,
-	formatSize,
-	truncateTail,
-	type ExtensionAPI,
-	type ExtensionContext,
-} from "@earendil-works/pi-coding-agent";
-import { Type } from "typebox";
+import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
+import { type Static, Type } from "typebox";
+import { cellResult, DESCRIPTION, RESET_NOTICE } from "./cell.ts";
 import { CellsView } from "./cells.ts";
-import { describeError, INTERRUPT_GRACE_MS, KernelLostError, KernelRuntime, OUTPUT_CAPTURE_LIMIT_BYTES } from "./kernel-runtime.ts";
-import { CHECKPOINT_ENTRY_TYPE, createRuntime } from "./persistence.ts";
+import { describeError, KernelLostError, type KernelRuntime } from "./kernel-runtime.ts";
+import { partialText } from "./output.ts";
+import { createRuntime, type Runtime } from "./persistence.ts";
 
-const RESET_NOTICE = [
-	"<ipython_kernel_reset>",
-	"The IPython kernel stopped. All in-memory variables, imports, tasks, and open resources from the previous kernel were lost; recreate them before continuing.",
-	"</ipython_kernel_reset>",
-].join("\n");
+const CODEMODE_NOTE =
+	"In codemode scripts, a Python exception resolves with `status: \"error\"`; the call rejects when the kernel is lost. Pass data into a cell as a JSON string, for example `json.loads(${JSON.stringify(JSON.stringify(data))})`.";
 
-const DESCRIPTION = [
-	"Execute Python in a persistent IPython kernel. Reuse variables, functions, datasets, and intermediate results across calls. Supports top-level await and native IPython magics. Checkpointed state follows the conversation branch; reloads and crashes restore the latest saved cell on that branch. Live resources, process state, and files are not rewound. The kernel runs with local user permissions, including filesystem and network access; it is not sandboxed.",
-	"ipython is your persistent control environment, not the native runtime of the project. Run project code, tests, and CLIs through the project's own interface (documented commands, `uv run ...`, `.venv/bin/python ...`) and treat their result as the relevant result. Do not install project dependencies into the kernel.",
-	"Kernel state persists across cells and checkpointed names survive resets and reloads. Keep reusable functions, datasets, read/search results, and intermediate computations in named variables. Save valuable results to explicit artifacts for recovery.",
-	"Use Python for loops, parsing, and state. Use the shell only to invoke programs.",
-	"In codemode scripts, a Python exception resolves with `status: \"error\"`; the call rejects when the kernel is lost. Pass data into a cell as a JSON string, for example `json.loads(${JSON.stringify(JSON.stringify(data))})`.",
-	`Output is truncated to ${DEFAULT_MAX_LINES} lines or ${formatSize(DEFAULT_MAX_BYTES)}; full truncated output is saved to a temporary file. Runaway cells exceeding ${formatSize(OUTPUT_CAPTURE_LIMIT_BYTES)} of output are interrupted; the kernel is killed only if it does not stop within ${INTERRUPT_GRACE_MS / 1000} seconds.`,
-].join("\n\n");
+/** Custom entry type for checkpoints of cells that another tool ran, since Pi does not save their results. */
+const CHECKPOINT_ENTRY_TYPE = "ipython-checkpoint";
+
+/** The checkpoint IDs on `branch`, newest first. */
+function checkpointIds(branch: SessionEntry[]): string[] {
+	const ids: string[] = [];
+	for (let index = branch.length - 1; index >= 0; index -= 1) {
+		const entry = branch[index];
+		let checkpoint: unknown;
+		if (entry.type === "custom" && entry.customType === CHECKPOINT_ENTRY_TYPE) {
+			checkpoint = (entry.data as { checkpoint?: unknown } | undefined)?.checkpoint;
+		} else if (entry.type === "message" && entry.message.role === "toolResult" && entry.message.toolName === "ipython") {
+			checkpoint = (entry.message.details as { checkpoint?: unknown } | undefined)?.checkpoint;
+		}
+		if (typeof checkpoint === "string") ids.push(checkpoint);
+	}
+	return ids;
+}
 
 const parameters = Type.Object({
 	code: Type.String({ description: "Python or an IPython cell" }),
@@ -54,54 +55,8 @@ interface IpythonDetails {
 	checkpoint?: string;
 }
 
-function stripAnsi(value: string): string {
-	return value.replace(/\x1b(?:\][^\x07]*(?:\x07|\x1b\\)|[@-_][0-?]*[ -/]*[@-~])/g, "");
-}
-
-function partialText(output: string): string {
-	const clean = stripAnsi(output);
-	const truncated = truncateTail(clean, {
-		maxLines: DEFAULT_MAX_LINES,
-		maxBytes: DEFAULT_MAX_BYTES,
-	});
-	if (!truncated.truncated) return truncated.content || "[no output yet]";
-	return `[Live output truncated; showing the tail]\n${truncated.content}`;
-}
-
-function finalText(output: string, kernel: KernelRuntime): {
-	text: string;
-	output: string;
-	truncated: boolean;
-	fullOutputPath?: string;
-} {
-	const clean = stripAnsi(output);
-	const truncated = truncateTail(clean, {
-		maxLines: DEFAULT_MAX_LINES,
-		maxBytes: DEFAULT_MAX_BYTES,
-	});
-	if (!truncated.truncated) {
-		return { text: truncated.content || "[no output]", output: truncated.content, truncated: false };
-	}
-
-	const fullOutputPath = kernel.saveOutput(clean);
-	const omittedLines = truncated.totalLines - truncated.outputLines;
-	const omittedBytes = truncated.totalBytes - truncated.outputBytes;
-	const notice = [
-		`[Output truncated: showing the last ${truncated.outputLines} of ${truncated.totalLines} lines`,
-		`(${formatSize(truncated.outputBytes)} of ${formatSize(truncated.totalBytes)}).`,
-		`${omittedLines} lines (${formatSize(omittedBytes)}) omitted.`,
-		`Full output saved to: ${fullOutputPath}]`,
-	].join(" ");
-	return {
-		text: `${notice}\n${truncated.content}`,
-		output: truncated.content,
-		truncated: true,
-		fullOutputPath,
-	};
-}
-
 export default function ipythonExtension(pi: ExtensionAPI) {
-	let runtime: (ReturnType<typeof createRuntime> & { sigterm: () => void }) | undefined;
+	let runtime: (Runtime & { sigterm: () => void }) | undefined;
 	// Checkpoint notices from opening the console, delivered with the next result.
 	let undelivered: string[] = [];
 	// Notices of cells that another tool ran, keyed by that tool's call until its result reaches the model.
@@ -131,7 +86,7 @@ export default function ipythonExtension(pi: ExtensionAPI) {
 		try {
 			const { kernel, checkpoints } = getRuntime(ctx);
 			const progress = (message: string) => ctx.ui.notify(message, "info");
-			undelivered.push(...await checkpoints.sync(ctx.sessionManager.getBranch(), ctx.cwd, ctx.signal, progress));
+			undelivered.push(...await checkpoints.sync(checkpointIds(ctx.sessionManager.getBranch()), ctx.cwd, ctx.signal, progress));
 			const connectionFile = await kernel.getConnectionFile(ctx.cwd, ctx.signal, progress);
 			await cells.toggle(ctx.cwd, connectionFile);
 		} catch (error) {
@@ -150,7 +105,7 @@ export default function ipythonExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "ipython",
 		label: "IPython",
-		description: DESCRIPTION,
+		description: `${DESCRIPTION}\n\n${CODEMODE_NOTE}`,
 		promptSnippet: "Persistent Python workspace for computation and data analysis",
 		parameters,
 		outputSchema,
@@ -195,7 +150,7 @@ export default function ipythonExtension(pi: ExtensionAPI) {
 			let execution: Awaited<ReturnType<KernelRuntime["execute"]>>;
 			let notices: string[];
 			try {
-				notices = await checkpoints.sync(ctx.sessionManager.getBranch(), ctx.cwd, signal, progress);
+				notices = await checkpoints.sync(checkpointIds(ctx.sessionManager.getBranch()), ctx.cwd, signal, progress);
 				execution = await kernel.execute(toolCallId, params.code, ctx.cwd, signal, progress, output);
 			} catch (error) {
 				if (error instanceof KernelLostError) forwarded.set(toolCallId, [RESET_NOTICE]);
@@ -205,43 +160,26 @@ export default function ipythonExtension(pi: ExtensionAPI) {
 				if (updateTimer) clearTimeout(updateTimer);
 			}
 			const { result, kernelReset } = execution;
-			const cellNotices = [...(kernelReset ? [RESET_NOTICE] : []), ...undelivered, ...notices];
-			const notice = cellNotices.join("\n\n");
+			const { data, header } = cellResult(execution, [...undelivered, ...notices], (text) => kernel.saveOutput(text));
+			const notice = data.notices.join("\n\n");
 			undelivered = [];
 			transcript?.output(result.output);
 			if (notice) transcript?.note(notice);
 			if (result.status !== "ok" && !result.output) transcript?.note(describeError(result.error));
 			transcript?.finish(`${result.status}${result.executionCount === undefined ? "" : ` | In [${result.executionCount}]`}`);
-			const formatted = finalText(result.output, kernel);
-			let visible = formatted.text;
-			if (notice) {
-				visible = formatted.text === "[no output]" ? notice : `${notice}\n\n${formatted.text}`;
-			}
-			if (result.status !== "ok") {
-				const fallback = describeError(result.error);
-				if (visible === "[no output]" && fallback) visible = fallback;
-			}
-			const status = result.status === "ok" ? "ok" : "error";
+			const body = header ? `${header}\n${data.output}` : data.output;
+			const text = (notice && body ? `${notice}\n\n${body}` : notice || body)
+				|| (data.status === "error" && describeError(result.error)) || "[no output]";
 			const details: IpythonDetails = {
-				status,
-				executionCount: result.executionCount,
+				status: data.status,
+				executionCount: data.executionCount,
 				kernelReset,
-				truncated: formatted.truncated,
-				fullOutputPath: formatted.fullOutputPath,
+				truncated: data.truncated,
+				fullOutputPath: data.fullOutputPath,
 				checkpoint: checkpoints.save(),
 			};
-			const structuredContent: JsonObject = {
-				status,
-				output: formatted.output,
-				truncated: formatted.truncated,
-				notices: cellNotices,
-			};
-			if (result.executionCount !== undefined) structuredContent.executionCount = result.executionCount;
-			if (status === "error") {
-				structuredContent.error = { ename: result.error?.ename ?? "Error", evalue: result.error?.evalue ?? "" };
-			}
-			if (formatted.fullOutputPath) structuredContent.fullOutputPath = formatted.fullOutputPath;
-			return { content: [{ type: "text", text: visible }], details, structuredContent, isError: status === "error" };
+			const structuredContent: Static<typeof outputSchema> = data;
+			return { content: [{ type: "text", text }], details, structuredContent, isError: data.status === "error" };
 		},
 	});
 
@@ -270,14 +208,10 @@ export default function ipythonExtension(pi: ExtensionAPI) {
 		runtime = undefined;
 		forwarded.clear();
 		try {
-			await closing?.checkpoints.close();
+			await closing?.close();
 		} finally {
-			try {
-				await closing?.kernel.shutdown();
-			} finally {
-				if (closing) process.off("SIGTERM", closing.sigterm);
-				await cells.shutdown();
-			}
+			if (closing) process.off("SIGTERM", closing.sigterm);
+			await cells.shutdown();
 		}
 	});
 }

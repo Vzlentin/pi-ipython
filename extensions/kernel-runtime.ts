@@ -1,16 +1,10 @@
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { execFile, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
-import {
-	DEFAULT_MAX_BYTES,
-	DEFAULT_MAX_LINES,
-	formatSize,
-	truncateTail,
-	type ExtensionAPI,
-} from "@earendil-works/pi-coding-agent";
+import { formatSize, partialText, stripAnsi } from "./output.ts";
 
 const EXTENSION_DIR = dirname(fileURLToPath(import.meta.url));
 const BRIDGE_PATH = join(EXTENSION_DIR, "bridge.py");
@@ -26,7 +20,7 @@ export const BRIDGE_PROTOCOL_VERSION = 2;
 export const KERNEL_STARTING_EVENT = "ipython:kernel-starting";
 
 /**
- * Emitted on `pi.events` before every kernel start. Listeners must write to it
+ * Emitted on the host's event bus (`pi.events` in Pi) before every kernel start. Listeners must write to it
  * before their first `await`: add environment variables for the bridge and
  * kernel, snippets to run hidden once the kernel is ready, and promises to await
  * before spawning.
@@ -35,6 +29,31 @@ export interface KernelStartingEvent {
 	env: Record<string, string>;
 	startupCode: string[];
 	waitFor(promise: Promise<unknown>): void;
+}
+
+/** The host's event bus, which receives `ipython:kernel-starting`: `pi.events` in Pi, the host's own bus elsewhere. */
+export interface KernelHost {
+	readonly events: { emit(name: string, data: unknown): unknown };
+}
+
+/** Runs a program and reports a failure as its exit code, like Pi's `exec`. */
+function execProcess(
+	command: string,
+	args: string[],
+	options: { signal?: AbortSignal; timeout?: number; cwd?: string },
+): Promise<{ code: number; stdout: string; stderr: string }> {
+	return new Promise((resolve) => {
+		execFile(
+			command,
+			args,
+			{ cwd: options.cwd, signal: options.signal, timeout: options.timeout, maxBuffer: 16 * 1024 * 1024 },
+			(error, stdout, stderr) => {
+				const code = error === null ? 0 : typeof error.code === "number" ? error.code : 1;
+				const message = error !== null && typeof error.code !== "number" ? error.message : "";
+				resolve({ code, stdout: String(stdout), stderr: [String(stderr), message].filter(Boolean).join("\n") });
+			},
+		);
+	});
 }
 
 export interface BridgeError {
@@ -91,19 +110,6 @@ export function shellQuote(value: string): string {
 	return `'${value.replaceAll("'", `'"'"'`)}'`;
 }
 
-function stripAnsi(value: string): string {
-	return value.replace(/\x1b(?:\][^\x07]*(?:\x07|\x1b\\)|[@-_][0-?]*[ -/]*[@-~])/g, "");
-}
-
-function partialOutput(output: string): string {
-	const truncated = truncateTail(stripAnsi(output), {
-		maxLines: DEFAULT_MAX_LINES,
-		maxBytes: DEFAULT_MAX_BYTES,
-	});
-	if (!truncated.truncated) return truncated.content || "[no output yet]";
-	return `[Live output truncated; showing the tail]\n${truncated.content}`;
-}
-
 export class KernelRuntime {
 	private child?: ChildProcessWithoutNullStreams;
 	private ready = false;
@@ -124,12 +130,12 @@ export class KernelRuntime {
 	private _generation = 0;
 	private shutdownPromise?: Promise<void>;
 	private readonly lifecycle = new AbortController();
-	private readonly pi: ExtensionAPI;
+	private readonly host: KernelHost;
 	private readonly startupCode: readonly string[];
 
 	/** `startupCode` runs hidden after every listener's snippets on each kernel start. */
-	constructor(pi: ExtensionAPI, startupCode: readonly string[] = []) {
-		this.pi = pi;
+	constructor(host: KernelHost, startupCode: readonly string[] = []) {
+		this.host = host;
 		this.startupCode = startupCode;
 	}
 
@@ -275,7 +281,7 @@ export class KernelRuntime {
 			"assert sys.version_info[:2] == (3, 12)",
 			"import IPython, ipykernel, jupyter_client, zmq, cloudpickle",
 		].join("; ");
-		const check = await this.pi.exec(PYTHON_PATH, ["-I", "-c", validation], { signal, timeout: 15_000 });
+		const check = await execProcess(PYTHON_PATH, ["-I", "-c", validation], { signal, timeout: 15_000 });
 		if (check.code === 0) return;
 		if (signal?.aborted) throw new Error("IPython runtime provisioning cancelled");
 
@@ -292,7 +298,7 @@ export class KernelRuntime {
 			process.platform === "darwin"
 				? ["-k", "-t", "300", PROVISION_LOCK, "bash", "-c", script]
 				: ["-w", "300", PROVISION_LOCK, "bash", "-c", script];
-		const result = await this.pi.exec(lockCommand, lockArgs, {
+		const result = await execProcess(lockCommand, lockArgs, {
 			signal,
 			timeout: PROVISION_TIMEOUT_MS,
 			cwd: EXTENSION_DIR,
@@ -315,7 +321,7 @@ export class KernelRuntime {
 			startupCode: [],
 			waitFor: (promise) => void waits.push(promise),
 		};
-		this.pi.events.emit(KERNEL_STARTING_EVENT, starting);
+		this.host.events.emit(KERNEL_STARTING_EVENT, starting);
 		await Promise.all(waits);
 		starting.startupCode.push(
 			`__import__('sys').path.insert(0, ${JSON.stringify(join(EXTENSION_DIR, "kernel"))})`,
@@ -506,7 +512,7 @@ export class KernelRuntime {
 			this.active = undefined;
 			this.pendingResetNotice = true;
 			void this.terminate().finally(() => active.reject(new Error(
-				`${reason}. The cell did not stop within ${INTERRUPT_GRACE_MS / 1000}s; the kernel was killed and in-memory state was lost.\n\n${partialOutput(active.output)}`,
+				`${reason}. The cell did not stop within ${INTERRUPT_GRACE_MS / 1000}s; the kernel was killed and in-memory state was lost.\n\n${partialText(active.output)}`,
 			)));
 		}, INTERRUPT_GRACE_MS);
 		active.interrupt = { reason, timer, overflow };
