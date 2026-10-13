@@ -55,7 +55,7 @@ export default function ipython({ durable, ai, events }: DurableHost) {
 				description: "\"error\" when the cell raised or was interrupted",
 			}),
 			output: ai.Type.String({ description: "Streams, display output and tracebacks, without ANSI codes" }),
-			executionCount: ai.Type.Optional(ai.Type.Number()),
+			executionCount: ai.Type.Optional(ai.Type.Integer()),
 			error: ai.Type.Optional(ai.Type.Object({ ename: ai.Type.String(), evalue: ai.Type.String() })),
 			truncated: ai.Type.Boolean({ description: "Only the tail of the output is kept" }),
 			fullOutputPath: ai.Type.Optional(ai.Type.String()),

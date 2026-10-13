@@ -37,7 +37,7 @@ const outputSchema = Type.Object({
 		description: "\"error\" when the cell raised or was interrupted",
 	}),
 	output: Type.String({ description: "Streams, display output and tracebacks, without ANSI codes" }),
-	executionCount: Type.Optional(Type.Number()),
+	executionCount: Type.Optional(Type.Integer()),
 	error: Type.Optional(Type.Object({ ename: Type.String(), evalue: Type.String() })),
 	truncated: Type.Boolean({ description: "Only the tail of the output is kept" }),
 	fullOutputPath: Type.Optional(Type.String()),
