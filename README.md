@@ -11,7 +11,7 @@ runs in hosts built on pi-durable, see [pi-durable](#pi-durable).
 Requirements:
 
 - macOS or Linux, with Bash and `lockf` (macOS) or `flock` (Linux).
-- Node.js 22.19 or newer, npm, Git, and Pi (tested with 1.1.0).
+- Node.js 22.19 or newer, npm, Git, and Pi (tested with 1.2.0).
 - `uv` on `PATH`. The first tool call provisions an extension-owned Python 3.12
   runtime with ipykernel, jupyter-client, and cloudpickle in `extensions/.python`,
   so it needs network access.
