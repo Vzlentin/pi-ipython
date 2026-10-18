@@ -1,59 +1,63 @@
 {
-  "name": "pi-ipython",
-  "version": "0.1.0",
-  "private": true,
-  "type": "module",
-  "description": "Persistent IPython kernel tool for Pi",
-  "keywords": [
-    "pi-package",
-    "ipython"
-  ],
-  "engines": {
-    "node": ">=22.19.0"
-  },
-  "scripts": {
-    "typecheck": "tsc -p tsconfig.json",
-    "test:kernel": "node --no-warnings tests/test_kernel.mjs && node --no-warnings tests/test_cells.mjs --kernel",
-    "test:persistence": "node --no-warnings tests/test_persistence.mjs && node --no-warnings tests/test_branches.mjs && node --no-warnings tests/test_checkpoint_limits.mjs",
-    "test:output": "node --no-warnings tests/test_output.mjs",
-    "test:durable": "node --no-warnings tests/test_durable.mjs",
-    "test": "npm run typecheck && npm run test:output && npm run test:kernel && npm run test:persistence && npm run test:durable"
-  },
-  "pi": {
-    "extensions": [
-      "./extensions/ipython.ts"
-    ]
-  },
-  "piDurable": {
-    "extensions": [
-      "./durable/index.ts"
-    ]
-  },
-  "peerDependencies": {
-    "@earendil-works/pi-ai": "*",
-    "@earendil-works/pi-coding-agent": "*",
-    "@earendil-works/pi-durable": "*",
-    "typebox": "*"
-  },
-  "peerDependenciesMeta": {
-    "@earendil-works/pi-coding-agent": {
-      "optional": true
-    },
-    "@earendil-works/pi-durable": {
-      "optional": true
-    },
-    "typebox": {
-      "optional": true
-    }
-  },
-  "devDependencies": {
-    "@earendil-works/chord": "1.2.0",
-    "@earendil-works/pi-ai": "1.2.0",
-    "@earendil-works/pi-coding-agent": "1.2.0",
-    "@earendil-works/pi-durable": "1.2.0",
-    "@types/node": "22.19.7",
-    "typebox": "1.3.27",
-    "typescript": "5.9.3"
-  },
-  "license": "MIT"
+	"name": "pi-ipython",
+	"version": "0.1.0",
+	"private": true,
+	"type": "module",
+	"description": "Persistent IPython kernel tool for Pi",
+	"keywords": [
+		"pi-package",
+		"ipython"
+	],
+	"engines": {
+		"node": ">=22.19.0"
+	},
+	"scripts": {
+		"lint": "biome check . && oxlint --deny-warnings",
+		"typecheck": "tsc -p tsconfig.json",
+		"test:kernel": "node --no-warnings tests/test_kernel.mjs && node --no-warnings tests/test_protocol.mjs && node --no-warnings tests/test_cells.mjs --kernel",
+		"test:persistence": "node --no-warnings tests/test_persistence.mjs && node --no-warnings tests/test_branches.mjs && node --no-warnings tests/test_checkpoint_limits.mjs",
+		"test:output": "node --no-warnings tests/test_output.mjs",
+		"test:durable": "node --no-warnings tests/test_durable.mjs",
+		"test": "npm run lint && npm run typecheck && npm run test:output && npm run test:kernel && npm run test:persistence && npm run test:durable"
+	},
+	"pi": {
+		"extensions": [
+			"./extensions/ipython.ts"
+		]
+	},
+	"piDurable": {
+		"extensions": [
+			"./durable/index.ts"
+		]
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-ai": "*",
+		"@earendil-works/pi-coding-agent": "*",
+		"@earendil-works/pi-durable": "*",
+		"typebox": "*"
+	},
+	"peerDependenciesMeta": {
+		"@earendil-works/pi-coding-agent": {
+			"optional": true
+		},
+		"@earendil-works/pi-durable": {
+			"optional": true
+		},
+		"typebox": {
+			"optional": true
+		}
+	},
+	"devDependencies": {
+		"@biomejs/biome": "2.5.15",
+		"@earendil-works/chord": "1.2.0",
+		"@earendil-works/pi-ai": "1.2.0",
+		"@earendil-works/pi-coding-agent": "1.2.0",
+		"@earendil-works/pi-durable": "1.2.0",
+		"@oxlint/plugins": "1.88.0",
+		"@types/node": "22.19.7",
+		"oxlint": "1.88.0",
+		"typebox": "1.3.27",
+		"typescript": "5.9.3"
+	},
+	"license": "MIT"
 }

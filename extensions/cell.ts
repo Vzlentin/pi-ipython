@@ -33,6 +33,11 @@ export type CellResult = {
 	fullOutputPath?: string;
 };
 
+export interface CellReport {
+	data: CellResult;
+	header?: string;
+}
+
 /**
  * The result of a cell that ran, with the restores before it in `notices`; a reset kernel adds its notice in front.
  * `header` is the line that tells the model the output was truncated and where `save` stored all of it.
@@ -41,18 +46,24 @@ export function cellResult(
 	execution: { result: BridgeResult; kernelReset: boolean },
 	notices: string[],
 	save: (text: string) => string,
-): { data: CellResult; header?: string } {
+): CellReport {
 	const { result, kernelReset } = execution;
 	const final = finalOutput(result.output, save);
+
 	const data: CellResult = {
 		status: result.status === "ok" ? "ok" : "error",
 		output: final.output,
 		truncated: final.truncated,
 		notices: kernelReset ? [RESET_NOTICE, ...notices] : notices,
 	};
+
 	// Absent fields stay absent, so scripts receive strict JSON.
 	if (result.executionCount !== undefined) data.executionCount = result.executionCount;
-	if (data.status === "error") data.error = { ename: result.error?.ename ?? "Error", evalue: result.error?.evalue ?? "" };
+
+	if (data.status === "error")
+		data.error = { ename: result.error?.ename ?? "Error", evalue: result.error?.evalue ?? "" };
+
 	if (final.fullOutputPath !== undefined) data.fullOutputPath = final.fullOutputPath;
+
 	return { data, header: final.header };
 }

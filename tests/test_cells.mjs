@@ -1,15 +1,17 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { promisify } from "node:util";
 import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { promisify } from "node:util";
 import { CellsView } from "../extensions/cells.ts";
-import { KernelRuntime } from "../extensions/kernel-runtime.ts";
 import ipythonExtension from "../extensions/ipython.ts";
+import { KernelRuntime } from "../extensions/kernel-runtime.ts";
 
 const originalHerdr = process.env.HERDR_ENV;
+
 process.env.HERDR_ENV = "1";
+
 const calls = [];
 const panes = new Set();
 const tabs = new Map();
@@ -20,14 +22,17 @@ let failGet = false;
 let failWait = false;
 let failMove = false;
 let onWait;
+
 const pi = {
 	async exec(command, args, options) {
 		assert.equal(command, "herdr");
 		calls.push(args);
 		const [group, action, id] = args;
 		assert.equal(options.timeout, action === "wait-output" ? 125000 : 5000);
+
 		if (action === "run") assert.match(args[3], /^printf '\\033\[2J\\033\[3J\\033\[H'; \/bin\/cat '[^']+'; exec /);
 		let result = {};
+
 		if (action === "current") {
 			assert.ok(args.includes("--current"));
 			result = { pane: { pane_id: "caller", tab_id: "caller-tab", workspace_id: "workspace" } };
@@ -44,6 +49,7 @@ const pi = {
 			return { code: 1, stderr: "Herdr unavailable", stdout: "" };
 		} else if (group === "tab") {
 			assert.equal(action, "close");
+
 			if (!tabs.has(id)) return { code: 1, stderr: JSON.stringify({ error: { code: "tab_not_found" } }), stdout: "" };
 			panes.delete(tabs.get(id));
 			tabs.delete(id);
@@ -53,13 +59,19 @@ const pi = {
 			assert.equal(args[args.indexOf("--source") + 1], "visible");
 			assert.equal(args[args.indexOf("--timeout") + 1], "120000");
 			assert.equal(args[args.indexOf("--regex") + 1], "In \\[\\d*\\]:");
+
 			if (options.signal.aborted) throw new Error("startup cancelled");
+
 			if (onWait) {
 				onWait();
-				await new Promise((_resolve, reject) => options.signal.addEventListener("abort", () => reject(new Error("startup cancelled")), { once: true }));
+				await new Promise((_resolve, reject) =>
+					options.signal.addEventListener("abort", () => reject(new Error("startup cancelled")), { once: true }),
+				);
 			}
+
 			if (failWait) return { code: 1, stdout: "", stderr: "viewer readiness timeout" };
 			readyPanes.add(id);
+
 			return { code: 0, stdout: "viewer prompt (not JSON)", stderr: "" };
 		} else if (action === "move") {
 			assert.ok(readyPanes.has(id));
@@ -69,11 +81,13 @@ const pi = {
 			assert.equal(args[args.indexOf("--split") + 1], "right");
 			panes.delete(id);
 			panes.add(`${id}-moved`);
+
 			for (const [tab, pane] of tabs) if (pane === id) tabs.delete(tab);
 			result = { move_result: { pane: { pane_id: `${id}-moved` } } };
 		} else if (action === "close") {
 			panes.delete(id);
 		}
+
 		return { code: 0, stdout: action === "rename" || action === "run" ? "" : JSON.stringify({ result }), stderr: "" };
 	},
 };
@@ -81,11 +95,15 @@ const pi = {
 const connectionDirectory = mkdtempSync(join(tmpdir(), "pi-cells-test-"));
 const firstConnection = join(connectionDirectory, "first.json");
 const secondConnection = join(connectionDirectory, "second.json");
+
 writeFileSync(firstConnection, JSON.stringify({ key: "test-key", iopub_port: 12345 }));
+
 writeFileSync(secondConnection, JSON.stringify({ key: "next-test-key", iopub_port: 23456 }));
+
 const cwd = process.cwd();
 
 const view = new CellsView(pi);
+
 try {
 	view.begin("print('hello')\n42");
 	view.output("hel");
@@ -99,8 +117,14 @@ try {
 	assert.equal(panes.size, 1);
 	assert.equal(nextPane, 1);
 	const command = calls.find((args) => args[1] === "run")[3];
-	assert.match(command, /; \/bin\/cat '[^']+'; exec 'env' 'JUPYTER_PATH=[^']+\/extensions\/\.python\/share\/jupyter' 'uv' 'tool' 'run' .*'--from' 'euporie==2\.10\.4' 'euporie-console' '--connection-file' /);
-	assert.match(command, /'--kernel-name' 'python3' '--show-remote-inputs' '--show-remote-outputs' '--no-mouse-support' '--no-lsp'$/);
+	assert.match(
+		command,
+		/; \/bin\/cat '[^']+'; exec 'env' 'JUPYTER_PATH=[^']+\/extensions\/\.python\/share\/jupyter' 'uv' 'tool' 'run' .*'--from' 'euporie==2\.10\.4' 'euporie-console' '--connection-file' /,
+	);
+	assert.match(
+		command,
+		/'--kernel-name' 'python3' '--show-remote-inputs' '--show-remote-outputs' '--no-mouse-support' '--no-lsp'$/,
+	);
 	const file = command.match(/cat '([^']+)';/)[1];
 	assert.equal(statSync(file).mode & 0o777, 0o600);
 	const text = readFileSync(file, "utf8");
@@ -109,14 +133,20 @@ try {
 	assert.match(text, /children completed: 1\/2/);
 	assert.match(text, /output cleared\/replaced/);
 	assert.match(text, /replacement/);
-	assert.doesNotMatch(text, /\x1b|clipboard|\x00/);
+	assert.doesNotMatch(text, /clipboard/);
+	assert.equal(text.includes("\x1b"), false);
+	assert.equal(text.includes("\x00"), false);
 	assert.match(text, /Cell 1 \| ok/);
 
 	// A shell alias must not replace history output with an interactive pager.
 	writeFileSync(join(connectionDirectory, "uv"), "#!/bin/sh\nprintf 'viewer started\\n'\n", { mode: 0o700 });
-	const launched = await promisify(execFile)("bash", ["--noprofile", "--norc", "-c",
-		"shopt -s expand_aliases\nalias cat=false\neval \"$1\"", "cells-test", command,
-	], { env: { ...process.env, PATH: `${connectionDirectory}:${process.env.PATH}` }, timeout: 5_000 });
+
+	const launched = await promisify(execFile)(
+		"bash",
+		["--noprofile", "--norc", "-c", 'shopt -s expand_aliases\nalias cat=false\neval "$1"', "cells-test", command],
+		{ env: { ...process.env, PATH: `${connectionDirectory}:${process.env.PATH}` }, timeout: 5_000 },
+	);
+
 	assert.equal(launched.stdout, `\x1b[2J\x1b[3J\x1b[H${text}viewer started\n`);
 
 	// A transient CLI failure must not forget ownership or open a second pane.
@@ -146,6 +176,7 @@ try {
 }
 
 const failed = new CellsView(pi);
+
 try {
 	failRun = true;
 	await assert.rejects(failed.toggle(cwd, firstConnection), /Herdr unavailable/);
@@ -171,17 +202,29 @@ for (const failure of ["wait", "move"]) {
 }
 
 const racing = new CellsView(pi);
-const waiting = new Promise((resolve) => { onWait = resolve; });
+
+const waiting = new Promise((resolve) => {
+	onWait = resolve;
+});
+
 const opening = racing.toggle(cwd, firstConnection);
+
 await waiting;
+
 const rejected = assert.rejects(opening, /startup cancelled/);
+
 await racing.shutdown();
+
 await rejected;
+
 onWait = undefined;
+
 assert.equal(panes.size, 0);
+
 assert.equal(tabs.size, 0);
 
 const limited = new CellsView(pi);
+
 try {
 	await limited.toggle(cwd, firstConnection);
 	const command = calls.filter((args) => args[1] === "run").at(-1)[3];
@@ -196,6 +239,7 @@ try {
 }
 
 const live = new CellsView(pi);
+
 try {
 	await live.toggle(cwd, firstConnection);
 	const command = calls.filter((args) => args[1] === "run").at(-1)[3];
@@ -224,38 +268,64 @@ const commands = new Map();
 const events = new Map();
 const notices = [];
 const originalPersistence = process.env.PI_IPYTHON_PERSISTENCE;
+
 process.env.PI_IPYTHON_PERSISTENCE = "0";
+
 ipythonExtension({
 	...pi,
-	registerTool(value) { tool = value; },
-	registerCommand(name, value) { commands.set(name, value); },
+	registerTool(value) {
+		tool = value;
+	},
+	registerCommand(name, value) {
+		commands.set(name, value);
+	},
 	registerShortcut(key, value) {
 		assert.equal(key, "ctrl+shift+i");
-		assert.equal(typeof value.handler, "function");
+		assert.ok(value.handler instanceof Function);
 		shortcut = value.handler;
 	},
-	on(name, handler) { events.set(name, handler); },
+	on(name, handler) {
+		events.set(name, handler);
+	},
 });
+
 const ctx = {
-	mode: "tui", cwd: process.cwd(), modelRegistry: {}, sessionManager: { getBranch: () => [] },
-	ui: { setWidget() {}, notify(...args) { notices.push(args); } },
+	mode: "tui",
+	cwd: process.cwd(),
+	modelRegistry: {},
+	sessionManager: { getBranch: () => [] },
+	ui: {
+		setWidget() {},
+		notify(...args) {
+			notices.push(args);
+		},
+	},
 };
+
 const execute = KernelRuntime.prototype.execute;
 const getConnectionFile = KernelRuntime.prototype.getConnectionFile;
 let connectionRequests = 0;
 let executions = 0;
 let outputDirectory;
+
 try {
-	KernelRuntime.prototype.getConnectionFile = async () => { connectionRequests++; return firstConnection; };
+	KernelRuntime.prototype.getConnectionFile = async () => {
+		connectionRequests++;
+
+		return firstConnection;
+	};
+
 	KernelRuntime.prototype.execute = async (_id, _code, _cwd, _signal, progress, output) => {
 		executions++;
 		progress("Starting IPython kernel...");
 		output("streamed output\n");
+
 		return {
 			kernelReset: true,
 			result: { status: "ok", executionCount: 1, output: "streamed output\n" },
 		};
 	};
+
 	const result = await tool.execute("cell", { code: "answer = 42" }, undefined, () => {}, ctx);
 	assert.equal(result.details.status, "ok");
 	// Run with the console closed, then open it: recorded history first, attached to the kernel.
@@ -276,8 +346,14 @@ try {
 	assert.match(readFileSync(file, "utf8"), />>> print\('while closed'\)/);
 	assert.equal(executions, 2);
 	assert.equal(connectionRequests, 3);
-	KernelRuntime.prototype.execute = async () => { throw new Error("cancelled; kernel state lost"); };
-	await assert.rejects(tool.execute("cancel", { code: "await pending" }, undefined, () => {}, ctx), /cancelled/);
+	KernelRuntime.prototype.execute = async () => {
+		throw new Error("cancelled; kernel state lost");
+	};
+
+	await assert.rejects(
+		tool.execute("cancel", { code: "await pending" }, undefined, () => {}, ctx),
+		/cancelled/,
+	);
 	assert.match(readFileSync(file, "utf8"), /Cell 3 \| error: Error: cancelled; kernel state lost/);
 	assert.deepEqual(notices, []);
 	// A failed removal of saved output is reported, and the console still closes.
@@ -302,13 +378,16 @@ try {
 	KernelRuntime.prototype.execute = execute;
 	KernelRuntime.prototype.getConnectionFile = getConnectionFile;
 	await events.get("session_shutdown")();
+
 	if (outputDirectory) {
 		chmodSync(outputDirectory, 0o700);
 		rmSync(outputDirectory, { recursive: true, force: true });
 	}
+
 	if (originalPersistence === undefined) delete process.env.PI_IPYTHON_PERSISTENCE;
 	else process.env.PI_IPYTHON_PERSISTENCE = originalPersistence;
 	rmSync(connectionDirectory, { recursive: true, force: true });
+
 	if (originalHerdr === undefined) delete process.env.HERDR_ENV;
 	else process.env.HERDR_ENV = originalHerdr;
 }
@@ -319,31 +398,64 @@ if (process.argv.includes("--kernel")) {
 	const view = new CellsView(pi);
 	const config = { cwd: process.cwd() };
 	let recoveredConnection;
+
 	try {
 		const first = await kernel.getConnectionFile(config.cwd, undefined, () => {});
 		assert.equal(existsSync(first), true);
 		await view.toggle(config.cwd, first);
-		await assert.rejects(kernel.execute("crash", "import os; os._exit(1)",
-			config.cwd, undefined, () => {}, () => {}), /kernel state was lost/);
+		await assert.rejects(
+			kernel.execute(
+				"crash",
+				"import os; os._exit(1)",
+				config.cwd,
+				undefined,
+				() => {},
+				() => {},
+			),
+			/kernel state was lost/,
+		);
 		recoveredConnection = await kernel.getConnectionFile(config.cwd, undefined, () => {});
 		assert.notEqual(recoveredConnection, first);
 		assert.equal(existsSync(first), false);
 		await view.toggle(config.cwd, recoveredConnection);
 		assert.equal(panes.size, 1);
-		const recovered = await kernel.execute("recovered", "saved = 42\nprint(saved)", config.cwd, undefined, () => {}, () => {});
+
+		const recovered = await kernel.execute(
+			"recovered",
+			"saved = 42\nprint(saved)",
+			config.cwd,
+			undefined,
+			() => {},
+			() => {},
+		);
+
 		assert.equal(recovered.kernelReset, true);
 		assert.equal(recovered.result.output.trim(), "42");
 		await view.shutdown();
 		assert.equal(existsSync(recoveredConnection), true);
-		const next = await kernel.execute("after-close", "print(saved + 1)", config.cwd, undefined, () => {}, () => {});
+
+		const next = await kernel.execute(
+			"after-close",
+			"print(saved + 1)",
+			config.cwd,
+			undefined,
+			() => {},
+			() => {},
+		);
+
 		assert.equal(next.kernelReset, false);
 		assert.equal(next.result.output.trim(), "43");
 	} finally {
 		await view.shutdown();
 		await kernel.shutdown();
+
 		if (originalHerdr === undefined) delete process.env.HERDR_ENV;
 		else process.env.HERDR_ENV = originalHerdr;
 	}
+
 	assert.equal(existsSync(recoveredConnection), false);
-	await assert.rejects(kernel.getConnectionFile(config.cwd, undefined, () => {}), /shutting down/);
+	await assert.rejects(
+		kernel.getConnectionFile(config.cwd, undefined, () => {}),
+		/shutting down/,
+	);
 }

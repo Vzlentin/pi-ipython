@@ -5,4 +5,6 @@
 - Keep the kernelspec override in `extensions/bridge.py`. It ensures the bridge and kernel use the same Python runtime.
 - Preserve the extension-owned Python 3.12 runtime. Do not edit or commit `extensions/.python/`, `extensions/.python.lock`, `__pycache__`, or other provisioned artifacts.
 - Treat cancellation, process-group reaping and kernel-reset reporting as one lifecycle. Changes in this area need coverage for cleanup and recovery, not only a successful execution check.
-- Run `npm test` for every code change.
+- Run `npm test` for every code change. It starts with `npm run lint`.
+- Lint: oxlint with the anti-slop plugin, vendored in `tools/oxlint/anti-slop/` (see its `UPSTREAM.md`). Biome only formats and sorts imports. Outside data is checked with TypeBox schemas, not `typeof`.
+- `kernel-runtime.ts` and `persistence.ts` check bridge and kernel data with type guards that use `typeof`, because the core also runs in pi-durable hosts where typebox cannot load. `.oxlintrc.json` allows this in these two files only.

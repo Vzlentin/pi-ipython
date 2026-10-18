@@ -1,4 +1,4 @@
-import { execFile, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { type ChildProcessWithoutNullStreams, execFile, spawn } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
@@ -33,7 +33,7 @@ export interface KernelStartingEvent {
 
 /** The host's event bus, which receives `ipython:kernel-starting`: `pi.events` in Pi, the host's own bus elsewhere. */
 export interface KernelHost {
-	readonly events: { emit(name: string, data: unknown): unknown };
+	readonly events: { emit(name: typeof KERNEL_STARTING_EVENT, data: KernelStartingEvent): void };
 }
 
 /** Runs a program and reports a failure as its exit code, like Pi's `exec`. */
@@ -48,8 +48,10 @@ function execProcess(
 			args,
 			{ cwd: options.cwd, signal: options.signal, timeout: options.timeout, maxBuffer: 16 * 1024 * 1024 },
 			(error, stdout, stderr) => {
-				const code = error === null ? 0 : typeof error.code === "number" ? error.code : 1;
-				const message = error !== null && typeof error.code !== "number" ? error.message : "";
+				// `code` is the exit code when the program ran, otherwise a Node error code such as ENOENT.
+				const exitCode = error !== null && Number.isInteger(error.code) ? Number(error.code) : undefined;
+				const code = error === null ? 0 : (exitCode ?? 1);
+				const message = error !== null && exitCode === undefined ? error.message : "";
 				resolve({ code, stdout: String(stdout), stderr: [String(stderr), message].filter(Boolean).join("\n") });
 			},
 		);
@@ -68,13 +70,111 @@ export interface BridgeResult {
 	output: string;
 }
 
+/** A JSON-decoded value. */
+export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
+
 interface ProtocolResult extends BridgeResult {
-	value?: unknown;
+	value?: JsonValue;
 }
 
 type BridgeRequest =
 	| { type: "execute"; request_id: string; code: string; cwd: string }
 	| { type: "evaluate"; request_id: string; expression: string };
+
+/** A line the bridge writes to stdout; see the `send` calls in bridge.py. */
+type BridgeMessage =
+	| { type: "kernel_started"; kernel_pgid: number }
+	| { type: "ready"; protocol: number; kernel_pgid: number; connection_file: string }
+	| { type: "fatal"; error: string; traceback: string }
+	| { type: "bridge_error"; request_id: string | null; error: string; traceback: string }
+	| { type: "clear"; request_id: string }
+	| { type: "output"; request_id: string; kind: string; text: string; continuation: boolean; final: boolean }
+	| {
+			type: "result";
+			request_id: string;
+			status: string;
+			execution_count?: number | null;
+			value?: JsonValue;
+			error?: { ename: string; evalue: string } | null;
+	  };
+
+/** Checks the fields that `handleLine` reads. Semantic checks, such as the process group range, stay there. */
+function isBridgeMessage(value: JsonValue): value is BridgeMessage {
+	if (!(value instanceof Object) || Array.isArray(value)) return false;
+
+	switch (value.type) {
+		case "kernel_started":
+			return typeof value.kernel_pgid === "number";
+		case "ready":
+			return (
+				typeof value.protocol === "number" &&
+				typeof value.kernel_pgid === "number" &&
+				typeof value.connection_file === "string"
+			);
+		case "fatal":
+			return typeof value.error === "string" && typeof value.traceback === "string";
+		case "bridge_error":
+			return (
+				(value.request_id === null || typeof value.request_id === "string") &&
+				typeof value.error === "string" &&
+				typeof value.traceback === "string"
+			);
+		case "clear":
+			return typeof value.request_id === "string";
+		case "output":
+			return (
+				typeof value.request_id === "string" &&
+				typeof value.kind === "string" &&
+				typeof value.text === "string" &&
+				typeof value.continuation === "boolean" &&
+				typeof value.final === "boolean"
+			);
+		case "result":
+			return (
+				typeof value.request_id === "string" &&
+				typeof value.status === "string" &&
+				(value.execution_count === undefined ||
+					value.execution_count === null ||
+					typeof value.execution_count === "number") &&
+				(value.error === undefined || value.error === null || isBridgeErrorValue(value.error))
+			);
+		default:
+			return false;
+	}
+}
+
+/** Says why a line with a known message type failed `isBridgeMessage`, or returns undefined for other lines. */
+function invalidMessageReason(value: JsonValue): string | undefined {
+	if (!(value instanceof Object) || Array.isArray(value)) return undefined;
+
+	switch (value.type) {
+		case "kernel_started":
+			return "IPython bridge reported an invalid kernel process group";
+		case "ready":
+			if (value.protocol !== BRIDGE_PROTOCOL_VERSION) return "IPython bridge reported an unsupported protocol version";
+
+			if (!Number.isSafeInteger(value.kernel_pgid)) return "IPython bridge reported an invalid kernel process group";
+
+			return "IPython bridge reported an invalid kernel connection file";
+		case "fatal":
+		case "bridge_error":
+		case "clear":
+		case "output":
+		case "result":
+			return `IPython bridge sent an invalid ${value.type} message`;
+		default:
+			return undefined;
+	}
+}
+
+function isBridgeErrorValue(value: JsonValue): value is { ename: string; evalue: string } {
+	return (
+		value instanceof Object &&
+		!Array.isArray(value) &&
+		typeof value.ename === "string" &&
+		typeof value.evalue === "string"
+	);
+}
 
 interface RequestOptions {
 	cancelReason: string;
@@ -98,8 +198,8 @@ interface ReadyWaiter {
 
 export class KernelLostError extends Error {}
 
-export function errorText(error: unknown): string {
-	return error instanceof Error ? error.message : String(error);
+export function errorText(cause: unknown): string {
+	return cause instanceof Error ? cause.message : String(cause);
 }
 
 export function describeError(error: BridgeError | undefined): string {
@@ -132,11 +232,20 @@ export class KernelRuntime {
 	private readonly lifecycle = new AbortController();
 	private readonly host: KernelHost;
 	private readonly startupCode: readonly string[];
+	private readonly bridgeCommand: readonly [string, ...string[]];
 
-	/** `startupCode` runs hidden after every listener's snippets on each kernel start. */
-	constructor(host: KernelHost, startupCode: readonly string[] = []) {
+	/**
+	 * `startupCode` runs hidden after every listener's snippets on each kernel start. `bridgeCommand` is the program and
+	 * arguments that start the bridge.
+	 */
+	constructor(
+		host: KernelHost,
+		startupCode: readonly string[] = [],
+		bridgeCommand: readonly [string, ...string[]] = [PYTHON_PATH, "-I", BRIDGE_PATH],
+	) {
 		this.host = host;
 		this.startupCode = startupCode;
+		this.bridgeCommand = bridgeCommand;
 	}
 
 	/** Increments each time a kernel becomes ready. */
@@ -150,6 +259,7 @@ export class KernelRuntime {
 		this.outputDirectory ??= mkdtempSync(join(tmpdir(), "pi-ipython-output-"));
 		const path = join(this.outputDirectory, `output-${++this.outputIndex}.txt`);
 		writeFileSync(path, text, "utf8");
+
 		return path;
 	}
 
@@ -162,22 +272,28 @@ export class KernelRuntime {
 		onOutput: (output: string) => void,
 	): Promise<{ result: BridgeResult; kernelReset: boolean }> {
 		const operationSignal = signal ? AbortSignal.any([signal, this.lifecycle.signal]) : this.lifecycle.signal;
+
 		if (operationSignal.aborted) throw new Error("IPython execution cancelled before it started");
 		await this.start(cwd, operationSignal, onProgress);
 		const kernelReset = this.pendingResetNotice;
 		this.pendingResetNotice = false;
-		const result = await this.request(
-			{ type: "execute", request_id: requestId, code, cwd },
-			operationSignal,
-			{ onOutput, cancelReason: "IPython execution cancelled" },
-		);
+
+		const result = await this.request({ type: "execute", request_id: requestId, code, cwd }, operationSignal, {
+			onOutput,
+			cancelReason: "IPython execution cancelled",
+		});
+
 		return { result, kernelReset };
 	}
 
 	/** Evaluates a Python expression in the running kernel and returns its JSON-decoded value. */
-	async evaluate(expression: string, options: { timeoutMs?: number; signal?: AbortSignal } = {}): Promise<unknown> {
+	async evaluate(
+		expression: string,
+		options: { timeoutMs?: number; signal?: AbortSignal } = {},
+	): Promise<JsonValue | undefined> {
 		const signal = options.signal ? AbortSignal.any([options.signal, this.lifecycle.signal]) : this.lifecycle.signal;
 		const timeoutMs = options.timeoutMs ?? EVALUATE_TIMEOUT_MS;
+
 		const result = await this.request(
 			{ type: "evaluate", request_id: `evaluate-${++this.evaluateIndex}`, expression },
 			signal,
@@ -186,14 +302,19 @@ export class KernelRuntime {
 				timeout: { ms: timeoutMs, reason: `IPython evaluation exceeded ${timeoutMs / 1000}s` },
 			},
 		);
+
 		if (result.status !== "ok") throw new Error(describeError(result.error) || "IPython evaluation failed");
+
 		return result.value;
 	}
 
 	private request(message: BridgeRequest, signal: AbortSignal, options: RequestOptions): Promise<ProtocolResult> {
 		if (!this.child || !this.ready) return Promise.reject(new Error("IPython kernel is unavailable"));
+
 		if (this.active) return Promise.reject(new Error("IPython kernel is already executing a request"));
+
 		if (signal.aborted) return Promise.reject(new Error(options.cancelReason));
+
 		return new Promise<ProtocolResult>((resolve, reject) => {
 			const active: ActiveExecution = {
 				requestId: message.request_id,
@@ -202,16 +323,21 @@ export class KernelRuntime {
 				resolve,
 				reject,
 			};
+
 			this.active = active;
 
 			const abort = () => {
 				if (this.active === active) this.interrupt(active, options.cancelReason);
 			};
+
 			signal.addEventListener("abort", abort, { once: true });
 			const limit = options.timeout;
-			const timeout = limit && setTimeout(() => {
-				if (this.active === active) this.interrupt(active, limit.reason);
-			}, limit.ms);
+
+			const timeout =
+				limit &&
+				setTimeout(() => {
+					if (this.active === active) this.interrupt(active, limit.reason);
+				}, limit.ms);
 
 			const settle = (callback: () => void) => {
 				signal.removeEventListener("abort", abort);
@@ -219,15 +345,16 @@ export class KernelRuntime {
 				clearTimeout(active.interrupt?.timer);
 				callback();
 			};
+
 			active.resolve = (value) => settle(() => resolve(value));
 			active.reject = (error) => settle(() => reject(new KernelLostError(error.message, { cause: error })));
 
 			try {
 				this.child!.stdin.write(`${JSON.stringify(message)}\n`, (error) => {
-					if (error) this.handleStdinError(this.child, error);
+					if (error) this.handleStdinError(this.child, errorText(error));
 				});
 			} catch (error) {
-				this.handleStdinError(this.child, error);
+				this.handleStdinError(this.child, errorText(error));
 			}
 		});
 	}
@@ -239,39 +366,46 @@ export class KernelRuntime {
 	): Promise<string> {
 		const operationSignal = signal ? AbortSignal.any([signal, this.lifecycle.signal]) : this.lifecycle.signal;
 		await this.start(cwd, operationSignal, onProgress);
+
 		if (operationSignal.aborted || !this.ready || !this.kernelConnectionFile) {
 			throw new Error("IPython kernel is not ready for a viewer");
 		}
+
 		return this.kernelConnectionFile;
 	}
 
-	async start(
-		cwd: string,
-		signal: AbortSignal | undefined,
-		onProgress: (message: string) => void,
-	): Promise<void> {
+	async start(cwd: string, signal: AbortSignal | undefined, onProgress: (message: string) => void): Promise<void> {
 		if (this.disposed) throw new Error("IPython runtime is shutting down");
+
 		if (this.stoppingPromise) await this.stoppingPromise;
+
 		if (this.child && this.ready) return;
+
 		if (!this.starting) {
 			const startup = this.startKernel(cwd, signal, onProgress);
+
 			const tracked = startup.finally(() => {
 				if (this.starting === tracked) this.starting = undefined;
 			});
+
 			this.starting = tracked;
 		}
+
 		await this.starting;
 	}
 
 	private async ensureRuntime(signal: AbortSignal | undefined, onProgress: (message: string) => void): Promise<void> {
 		if (!this.provisioning) {
 			const provision = this.provision(signal, onProgress);
+
 			const tracked = provision.catch((error) => {
 				if (this.provisioning === tracked) this.provisioning = undefined;
 				throw error;
 			});
+
 			this.provisioning = tracked;
 		}
+
 		await this.provisioning;
 	}
 
@@ -281,11 +415,15 @@ export class KernelRuntime {
 			"assert sys.version_info[:2] == (3, 12)",
 			"import IPython, ipykernel, jupyter_client, zmq, cloudpickle",
 		].join("; ");
+
 		const check = await execProcess(PYTHON_PATH, ["-I", "-c", validation], { signal, timeout: 15_000 });
+
 		if (check.code === 0) return;
+
 		if (signal?.aborted) throw new Error("IPython runtime provisioning cancelled");
 
 		onProgress("Provisioning extension-owned Python 3.12 and IPython runtime with uv...");
+
 		const script = [
 			"set -eu",
 			`if ${shellQuote(PYTHON_PATH)} -I -c ${shellQuote(validation)} >/dev/null 2>&1; then exit 0; fi`,
@@ -293,16 +431,20 @@ export class KernelRuntime {
 			`uv pip install --no-config --strict --python ${shellQuote(PYTHON_PATH)} 'ipykernel>=7,<8' 'jupyter-client>=8,<9' 'cloudpickle>=3,<4'`,
 			`${shellQuote(PYTHON_PATH)} -I -c ${shellQuote(validation)}`,
 		].join("\n");
+
 		const lockCommand = process.platform === "darwin" ? "lockf" : "flock";
+
 		const lockArgs =
 			process.platform === "darwin"
 				? ["-k", "-t", "300", PROVISION_LOCK, "bash", "-c", script]
 				: ["-w", "300", PROVISION_LOCK, "bash", "-c", script];
+
 		const result = await execProcess(lockCommand, lockArgs, {
 			signal,
 			timeout: PROVISION_TIMEOUT_MS,
 			cwd: EXTENSION_DIR,
 		});
+
 		if (result.code !== 0) {
 			const diagnostics = [result.stderr, result.stdout].filter(Boolean).join("\n").trim();
 			throw new Error(`Failed to provision the IPython runtime with uv${diagnostics ? `:\n${diagnostics}` : ""}`);
@@ -316,11 +458,13 @@ export class KernelRuntime {
 	): Promise<void> {
 		await this.ensureRuntime(signal, onProgress);
 		const waits: Promise<unknown>[] = [];
+
 		const starting: KernelStartingEvent = {
 			env: {},
 			startupCode: [],
 			waitFor: (promise) => void waits.push(promise),
 		};
+
 		this.host.events.emit(KERNEL_STARTING_EVENT, starting);
 		await Promise.all(waits);
 		starting.startupCode.push(
@@ -328,13 +472,17 @@ export class KernelRuntime {
 			"__import__('pi_ipython_interrupt').install(get_ipython().kernel)",
 			...this.startupCode,
 		);
+
 		if (signal?.aborted) throw new Error("IPython startup cancelled");
 		onProgress("Starting IPython kernel...");
 
 		this.stderr = "";
 		this.stopping = false;
 		this.ready = false;
-		const child = spawn(PYTHON_PATH, ["-I", BRIDGE_PATH], {
+
+		const [command, ...args] = this.bridgeCommand;
+
+		const child = spawn(command, args, {
 			cwd,
 			detached: process.platform !== "win32",
 			env: {
@@ -347,6 +495,7 @@ export class KernelRuntime {
 			},
 			stdio: ["pipe", "pipe", "pipe"],
 		});
+
 		this.child = child;
 
 		const lines = createInterface({ input: child.stdout });
@@ -354,7 +503,7 @@ export class KernelRuntime {
 		child.stderr.on("data", (chunk: Buffer | string) => {
 			this.stderr = `${this.stderr}${chunk.toString()}`.slice(-16_384);
 		});
-		child.stdin.on("error", (error) => this.handleStdinError(child, error));
+		child.stdin.on("error", (error) => this.handleStdinError(child, error.message));
 		child.stdin.write(`${JSON.stringify({ type: "startup", code: starting.startupCode })}\n`);
 		child.once("error", (error) => this.handleExit(child, `bridge spawn failed: ${error.message}`));
 		child.once("close", (code, terminatedBy) => {
@@ -364,6 +513,7 @@ export class KernelRuntime {
 
 		await new Promise<void>((resolve, reject) => {
 			let settled = false;
+
 			const finish = (callback: () => void) => {
 				if (settled) return;
 				settled = true;
@@ -372,11 +522,15 @@ export class KernelRuntime {
 				this.readyWaiter = undefined;
 				callback();
 			};
+
 			const abort = () => finish(() => reject(new Error("IPython startup cancelled")));
+
 			const timeout = setTimeout(
-				() => finish(() => reject(new Error(`IPython kernel did not become ready within ${STARTUP_TIMEOUT_MS / 1000}s`))),
+				() =>
+					finish(() => reject(new Error(`IPython kernel did not become ready within ${STARTUP_TIMEOUT_MS / 1000}s`))),
 				STARTUP_TIMEOUT_MS,
 			);
+
 			this.readyWaiter = {
 				resolve: () => finish(resolve),
 				reject: (error) => finish(() => reject(error)),
@@ -390,11 +544,26 @@ export class KernelRuntime {
 
 	private handleLine(child: ChildProcessWithoutNullStreams, line: string): void {
 		if (this.child !== child) return;
-		let message: any;
+		let message: JsonValue | undefined;
+
 		try {
 			message = JSON.parse(line);
-		} catch {
-			this.stderr = `${this.stderr}\nNon-protocol bridge output: ${line}`.slice(-16_384);
+		} catch {}
+
+		if (message === undefined || !isBridgeMessage(message)) {
+			const reason = message === undefined ? undefined : invalidMessageReason(message);
+
+			if (reason === undefined) {
+				this.stderr = `${this.stderr}\nNon-protocol bridge output: ${line}`.slice(-16_384);
+
+				return;
+			}
+
+			this.readyWaiter?.reject(new Error(reason));
+			this.failActive(`${reason}. The kernel was stopped and all in-memory state was lost.`);
+			this.pendingResetNotice ||= this.ready;
+			this.kill();
+
 			return;
 		}
 
@@ -402,100 +571,139 @@ export class KernelRuntime {
 			if (!Number.isSafeInteger(message.kernel_pgid) || message.kernel_pgid <= 1) {
 				this.readyWaiter?.reject(new Error("IPython bridge reported an invalid kernel process group"));
 				this.kill();
+
 				return;
 			}
+
 			this.kernelPgid = message.kernel_pgid;
+
 			return;
 		}
+
 		if (message.type === "ready") {
 			if (message.protocol !== BRIDGE_PROTOCOL_VERSION) {
 				this.readyWaiter?.reject(new Error("IPython bridge reported an unsupported protocol version"));
 				this.kill();
+
 				return;
 			}
+
 			if (!Number.isSafeInteger(message.kernel_pgid) || message.kernel_pgid <= 1) {
 				this.readyWaiter?.reject(new Error("IPython bridge reported an invalid kernel process group"));
 				this.kill();
+
 				return;
 			}
+
 			if (this.kernelPgid !== undefined && this.kernelPgid !== message.kernel_pgid) {
 				this.readyWaiter?.reject(new Error("IPython bridge changed kernel process groups during startup"));
 				this.kill();
+
 				return;
 			}
-			if (typeof message.connection_file !== "string" || !isAbsolute(message.connection_file)) {
+
+			if (!isAbsolute(message.connection_file)) {
 				this.readyWaiter?.reject(new Error("IPython bridge reported an invalid kernel connection file"));
 				this.kill();
+
 				return;
 			}
+
 			this.kernelPgid = message.kernel_pgid;
 			this.kernelConnectionFile = message.connection_file;
 			this.ready = true;
 			this._generation += 1;
 			this.readyWaiter?.resolve();
+
 			return;
 		}
+
 		if (message.type === "fatal") {
 			const diagnostics = [message.error, message.traceback, this.stderr].filter(Boolean).join("\n");
 			this.readyWaiter?.reject(new Error(`IPython bridge failed:\n${diagnostics}`));
 			this.failActive(`IPython bridge failed and kernel state was lost:\n${diagnostics}`);
 			this.pendingResetNotice ||= this.ready;
 			this.kill();
+
 			return;
 		}
 
 		const active = this.active;
+
 		if (!active || message.request_id !== active.requestId) return;
+
 		if (message.type === "clear") {
 			active.output = "";
 			active.onOutput?.(active.output);
+
 			return;
 		}
-		if (message.type === "output" && typeof message.text === "string") {
+
+		if (message.type === "output") {
 			if (active.interrupt?.overflow) return;
-			const kind = String(message.kind ?? "stdout");
+			const { kind } = message;
+
 			if (kind === "stdout" || kind === "stderr") {
 				active.output += message.text;
 			} else {
 				if (!message.continuation && active.output && !active.output.endsWith("\n")) active.output += "\n";
 				active.output += message.text;
+
 				if (message.final && !active.output.endsWith("\n")) active.output += "\n";
 			}
+
 			if (Buffer.byteLength(active.output, "utf8") > OUTPUT_CAPTURE_LIMIT_BYTES) {
 				let captureNotice: string;
+
 				try {
 					captureNotice = `Captured output saved to: ${this.saveOutput(stripAnsi(active.output))}`;
 				} catch (error) {
 					captureNotice = `Could not save captured output: ${errorText(error)}`;
 				}
-				this.interrupt(active, `IPython output exceeded ${formatSize(OUTPUT_CAPTURE_LIMIT_BYTES)}. ${captureNotice}`, true);
+
+				this.interrupt(
+					active,
+					`IPython output exceeded ${formatSize(OUTPUT_CAPTURE_LIMIT_BYTES)}. ${captureNotice}`,
+					true,
+				);
+
 				return;
 			}
+
 			active.onOutput?.(active.output);
+
 			return;
 		}
+
 		if (message.type === "bridge_error") {
 			const diagnostics = [message.error, message.traceback].filter(Boolean).join("\n");
 			this.active = undefined;
 			this.pendingResetNotice = true;
 			active.reject(new Error(`IPython bridge error; kernel state was lost:\n${diagnostics}`));
 			this.kill();
+
 			return;
 		}
+
 		if (message.type === "result") {
 			this.active = undefined;
+
 			const result: ProtocolResult = {
-				status: String(message.status ?? "error"),
-				executionCount: typeof message.execution_count === "number" ? message.execution_count : undefined,
+				status: message.status,
+				executionCount: message.execution_count ?? undefined,
 				value: message.value,
-				error: message.error,
+				error: message.error ?? undefined,
 				output: active.output,
 			};
+
 			const reason = active.interrupt?.reason;
+
 			if (reason === undefined) {
 				active.resolve(result);
+
 				return;
 			}
+
 			active.resolve({
 				...result,
 				status: "error",
@@ -507,28 +715,35 @@ export class KernelRuntime {
 
 	private interrupt(active: ActiveExecution, reason: string, overflow = false): void {
 		if (active.interrupt) return;
+
 		const timer = setTimeout(() => {
 			if (this.active !== active) return;
 			this.active = undefined;
 			this.pendingResetNotice = true;
-			void this.terminate().finally(() => active.reject(new Error(
-				`${reason}. The cell did not stop within ${INTERRUPT_GRACE_MS / 1000}s; the kernel was killed and in-memory state was lost.\n\n${partialText(active.output)}`,
-			)));
+			void this.terminate().finally(() =>
+				active.reject(
+					new Error(
+						`${reason}. The cell did not stop within ${INTERRUPT_GRACE_MS / 1000}s; the kernel was killed and in-memory state was lost.\n\n${partialText(active.output)}`,
+					),
+				),
+			);
 		}, INTERRUPT_GRACE_MS);
+
 		active.interrupt = { reason, timer, overflow };
 		this.signalProcessGroup(this.kernelPgid, "SIGINT");
 	}
 
-	private handleStdinError(child: ChildProcessWithoutNullStreams | undefined, error: unknown): void {
+	private handleStdinError(child: ChildProcessWithoutNullStreams | undefined, reason: string): void {
 		if (!child || this.child !== child) return;
-		this.stderr = `${this.stderr}\nBridge stdin failed: ${errorText(error)}`.slice(-16_384);
+		this.stderr = `${this.stderr}\nBridge stdin failed: ${reason}`.slice(-16_384);
 		this.pendingResetNotice ||= this.ready;
-		this.failActive(`Failed to communicate with IPython. The kernel state was lost: ${errorText(error)}`);
+		this.failActive(`Failed to communicate with IPython. The kernel state was lost: ${reason}`);
 		this.kill();
 	}
 
 	private failActive(message: string): void {
 		const active = this.active;
+
 		if (!active) return;
 		this.active = undefined;
 		active.reject(new Error(message));
@@ -547,6 +762,7 @@ export class KernelRuntime {
 		const diagnostics = this.stderr.trim();
 		const suffix = diagnostics ? `\n${diagnostics}` : "";
 		this.readyWaiter?.reject(new Error(`IPython ${reason}${suffix}`));
+
 		if (!expected) {
 			if (kernelPgid) this.terminateProcessGroup(kernelPgid);
 			this.pendingResetNotice ||= hadState;
@@ -561,6 +777,7 @@ export class KernelRuntime {
 	private terminate(): Promise<void> {
 		if (this.stoppingPromise) return this.stoppingPromise;
 		const child = this.child;
+
 		if (!child) return Promise.resolve();
 		const kernelPgid = this.kernelPgid;
 		this.stopping = true;
@@ -571,27 +788,35 @@ export class KernelRuntime {
 			let bridgeClosed = child.exitCode !== null;
 			let forceTimer: ReturnType<typeof setTimeout> | undefined;
 			let giveUpTimer: ReturnType<typeof setTimeout> | undefined;
+
 			const finish = () => {
 				if (settled) return;
 				settled = true;
+
 				if (forceTimer) clearTimeout(forceTimer);
+
 				if (giveUpTimer) clearTimeout(giveUpTimer);
 				resolve();
 			};
+
 			child.once("close", () => {
 				bridgeClosed = true;
+
 				if (!this.isProcessGroupAlive(kernelPgid)) finish();
 			});
 			forceTimer = setTimeout(() => {
 				this.signalProcessGroup(kernelPgid, "SIGKILL");
+
 				try {
 					if (process.platform !== "win32" && child.pid) process.kill(-child.pid, "SIGKILL");
 					else child.kill("SIGKILL");
 				} catch {}
+
 				if (bridgeClosed) finish();
 			}, 1_000);
 			giveUpTimer = setTimeout(finish, 2_000);
 			this.signalProcessGroup(kernelPgid, "SIGTERM");
+
 			try {
 				if (process.platform !== "win32" && child.pid) process.kill(-child.pid, "SIGTERM");
 				else child.kill("SIGTERM");
@@ -601,17 +826,23 @@ export class KernelRuntime {
 				} catch {}
 			}
 		});
+
 		const stopping = processStopping.then(() => this.reapProcessGroup(kernelPgid));
+
 		const tracked = stopping.finally(() => {
 			if (this.kernelPgid === kernelPgid) this.kernelPgid = undefined;
+
 			if (this.stoppingPromise === tracked) this.stoppingPromise = undefined;
 		});
+
 		this.stoppingPromise = tracked;
+
 		return tracked;
 	}
 
 	private signalProcessGroup(pgid: number | undefined, signal: NodeJS.Signals): void {
 		if (process.platform === "win32" || !pgid) return;
+
 		try {
 			process.kill(-pgid, signal);
 		} catch {}
@@ -619,8 +850,10 @@ export class KernelRuntime {
 
 	private isProcessGroupAlive(pgid: number | undefined): boolean {
 		if (process.platform === "win32" || !pgid) return false;
+
 		try {
 			process.kill(-pgid, 0);
+
 			return true;
 		} catch {
 			return false;
@@ -636,13 +869,14 @@ export class KernelRuntime {
 		if (!this.isProcessGroupAlive(pgid)) return;
 		this.signalProcessGroup(pgid, "SIGTERM");
 		await new Promise((resolve) => setTimeout(resolve, 250));
+
 		if (!this.isProcessGroupAlive(pgid)) return;
 		this.signalProcessGroup(pgid, "SIGKILL");
 		await new Promise((resolve) => setTimeout(resolve, 100));
 	}
 
 	shutdown(): Promise<void> {
-		return this.shutdownPromise ??= this.shutdownRuntime();
+		return (this.shutdownPromise ??= this.shutdownRuntime());
 	}
 
 	private async shutdownRuntime(): Promise<void> {
@@ -653,20 +887,25 @@ export class KernelRuntime {
 
 		const child = this.child;
 		const kernelPgid = this.kernelPgid;
+
 		if (child) {
 			this.stopping = true;
 			await new Promise<void>((resolve) => {
 				let settled = false;
+
 				const finish = () => {
 					if (settled) return;
 					settled = true;
 					clearTimeout(timeout);
 					resolve();
 				};
+
 				const timeout = setTimeout(() => {
 					void this.terminate().finally(finish);
 				}, 1_500);
+
 				child.once("close", finish);
+
 				try {
 					child.stdin.write(`${JSON.stringify({ type: "shutdown" })}\n`, (error) => {
 						if (error) void this.terminate();
@@ -676,7 +915,9 @@ export class KernelRuntime {
 				}
 			});
 		}
+
 		await this.reapProcessGroup(kernelPgid);
+
 		if (this.outputDirectory) rmSync(this.outputDirectory, { recursive: true, force: true });
 	}
 }
