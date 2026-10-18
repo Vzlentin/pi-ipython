@@ -2,11 +2,12 @@ import { randomUUID } from "node:crypto";
 import { lstatSync, mkdirSync, readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { errorText, type KernelHost, KernelRuntime } from "./kernel-runtime.ts";
+import { errorText, type JsonValue, type KernelHost, KernelRuntime } from "./kernel-runtime.ts";
 
 const RESTORE_TIMEOUT_MS = 10_000;
 const SAVE_TIMEOUT_MS = 60_000;
 const CLOSE_TIMEOUT_MS = 10_000;
+
 // A value whose unpickling kills the kernel is deleted by the next attempt, so each
 // attempt after the first gets past one more such value.
 const RESTORE_ATTEMPTS = 3;
@@ -16,41 +17,77 @@ type RestoreSummary =
 	| { status: "unavailable"; error: string }
 	| { status: "empty"; fellBack: boolean }
 	| {
-		status: "restored";
-		id: string;
-		cell: number;
-		restored: string[];
-		skipped: Record<string, string>;
-		fellBack: boolean;
-	};
+			status: "restored";
+			id: string;
+			cell: number;
+			restored: string[];
+			skipped: Record<string, string>;
+			fellBack: boolean;
+	  };
+
+function isRestoreSummary(value: JsonValue | undefined): value is RestoreSummary {
+	if (!(value instanceof Object) || Array.isArray(value)) return false;
+
+	if (value.status === "unavailable") return typeof value.error === "string";
+
+	if (value.status === "empty") return typeof value.fellBack === "boolean";
+
+	if (value.status !== "restored") return false;
+	const { restored, skipped } = value;
+
+	if (
+		typeof value.id !== "string" ||
+		typeof value.cell !== "number" ||
+		typeof value.fellBack !== "boolean" ||
+		!Array.isArray(restored) ||
+		!(skipped instanceof Object) ||
+		Array.isArray(skipped)
+	) {
+		return false;
+	}
+
+	for (const name of restored) if (typeof name !== "string") return false;
+
+	for (const reason of Object.values(skipped)) if (typeof reason !== "string") return false;
+
+	return true;
+}
 
 function persistenceEnabled(cwd: string): boolean {
 	if (process.env.PI_IPYTHON_PERSISTENCE === "0") return false;
+
 	for (let path = resolve(cwd); ; path = dirname(path)) {
 		const configPath = join(path, ".pi", "pi-ipython.json");
 		let text: string | undefined;
+
 		try {
 			text = readFileSync(configPath, "utf8");
 		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+			if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
 		}
+
 		if (text !== undefined) {
 			let config: unknown;
+
 			try {
 				config = JSON.parse(text);
 			} catch (error) {
 				throw new Error(`Invalid IPython configuration ${configPath}: ${errorText(error)}`);
 			}
-			if ((config as { persistence?: unknown } | null)?.persistence === false) return false;
+
+			if (config instanceof Object && "persistence" in config && config.persistence === false) return false;
 		}
+
 		try {
 			lstatSync(join(path, ".git"));
 			break;
 		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+			if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
 		}
+
 		if (dirname(path) === path) break;
 	}
+
 	return true;
 }
 
@@ -58,6 +95,7 @@ function persistenceEnabled(cwd: string): boolean {
 function checkpointBase(): string {
 	const base = resolve(process.env.XDG_CACHE_HOME || join(homedir(), ".cache"));
 	mkdirSync(base, { recursive: true });
+
 	return realpathSync(base);
 }
 
@@ -71,12 +109,15 @@ export interface Runtime {
 /** Creates the kernel and its checkpoints, enabled unless `cwd` opts out. */
 export function createRuntime(host: KernelHost, cwd: string): Runtime {
 	const enabled = persistenceEnabled(cwd);
+
 	// Runs after all other startup code, so names supplied by extensions are never checkpointed.
 	const startupCode = enabled
 		? [`__import__('pi_ipython_state').initialize(get_ipython(), ${JSON.stringify(checkpointBase())})`]
 		: [];
+
 	const kernel = new KernelRuntime(host, startupCode);
 	const checkpoints = new Checkpoints(kernel, enabled);
+
 	return {
 		kernel,
 		checkpoints,
@@ -92,6 +133,7 @@ export function createRuntime(host: KernelHost, cwd: string): Runtime {
 
 function restoreNotice(summary: RestoreSummary): string {
 	if (summary.status === "unavailable") return `IPython checkpoint storage unavailable: ${summary.error}`;
+
 	if (summary.status === "empty") {
 		return [
 			"<ipython_state_restored>",
@@ -101,15 +143,22 @@ function restoreNotice(summary: RestoreSummary): string {
 			"</ipython_state_restored>",
 		].join("\n");
 	}
+
 	const restored = summary.restored.join(", ") || "none";
-	const skipped = Object.entries(summary.skipped)
-		.map(([name, reason]) => `${name} (${reason})`).join("; ") || "none";
+
+	const skipped =
+		Object.entries(summary.skipped)
+			.map(([name, reason]) => `${name} (${reason})`)
+			.join("; ") || "none";
+
 	return [
 		"<ipython_state_restored>",
 		`Kernel state now matches this branch as of In [${summary.cell}]: ${restored}. Not restored: ${skipped}. Variables created on the branch you left are gone.`,
 		summary.fellBack ? "The newest checkpoint on this branch was unavailable; used an older one." : undefined,
 		"</ipython_state_restored>",
-	].filter(Boolean).join("\n");
+	]
+		.filter(Boolean)
+		.join("\n");
 }
 
 /**
@@ -141,7 +190,11 @@ export class Checkpoints {
 		if (!this.enabled) return Promise.resolve([]);
 		// Serialized with saves and other syncs; the kernel refuses overlapping requests as busy.
 		const run = this.pending.then(() => this.restoreBranch(candidates, cwd, signal, onProgress));
-		this.pending = run.then(() => {}, () => {});
+		this.pending = run.then(
+			() => {},
+			() => {},
+		);
+
 		return run;
 	}
 
@@ -153,31 +206,42 @@ export class Checkpoints {
 	): Promise<string[]> {
 		await this.kernel.start(cwd, signal, onProgress);
 		let notice: string | undefined;
+
 		for (let attempt = 1; ; attempt += 1) {
 			const generation = this.kernel.generation;
 			notice = await this.restore(candidates, signal);
 			await this.kernel.start(cwd, signal, onProgress);
+
 			if (this.kernel.generation === generation) break;
+
 			if (attempt === RESTORE_ATTEMPTS) {
 				notice = `IPython checkpoint restore killed the kernel ${RESTORE_ATTEMPTS} times; continuing on a fresh kernel. The next call retries without the values that killed it.`;
 				break;
 			}
 		}
+
 		const notices = [this.saveFailure, notice].filter((text): text is string => text !== undefined);
 		this.saveFailure = undefined;
+
 		return notices;
 	}
 
 	private async restore(candidates: string[], signal: AbortSignal | undefined): Promise<string | undefined> {
 		try {
 			const summary = await this.call("restore", [candidates], { timeoutMs: RESTORE_TIMEOUT_MS, signal });
-			return summary === null ? undefined : restoreNotice(summary as RestoreSummary);
+
+			if (summary === null) return undefined;
+
+			if (!isRestoreSummary(summary)) throw new Error("pi_ipython_state.restore returned an invalid summary");
+
+			return restoreNotice(summary);
 		} catch (error) {
 			// A cancelled restore leaves the namespace marked partial, so the next sync restores again.
 			if (signal?.aborted) throw error;
 			// A restore that failed or timed out is not retried. The kernel may be dead, in which case
 			// its successor starts with nothing loaded and the retry loop restores again.
 			await this.call("accept", [candidates[0] ?? null]).catch(() => {});
+
 			return `IPython checkpoint restore failed; continuing with the current namespace: ${errorText(error)}`;
 		}
 	}
@@ -189,9 +253,13 @@ export class Checkpoints {
 		this.pending = this.pending
 			.then(() => new Promise<void>((resolve) => setImmediate(resolve)))
 			.then(() => this.call("save", [id], { timeoutMs: SAVE_TIMEOUT_MS }))
-			.then(() => {}, (error) => {
-				this.saveFailure = `IPython checkpoint for the previous cell was not saved: ${errorText(error)}`;
-			});
+			.then(
+				() => {},
+				(error) => {
+					this.saveFailure = `IPython checkpoint for the previous cell was not saved: ${errorText(error)}`;
+				},
+			);
+
 		return id;
 	}
 
@@ -199,13 +267,16 @@ export class Checkpoints {
 		let timer: ReturnType<typeof setTimeout> | undefined;
 		await Promise.race([
 			this.pending,
-			new Promise<void>((resolve) => { timer = setTimeout(resolve, CLOSE_TIMEOUT_MS); }),
+			new Promise<void>((resolve) => {
+				timer = setTimeout(resolve, CLOSE_TIMEOUT_MS);
+			}),
 		]);
 		clearTimeout(timer);
 	}
 
 	private call(name: string, args: unknown[], options: { timeoutMs?: number; signal?: AbortSignal } = {}) {
 		const payload = JSON.stringify(JSON.stringify(args));
+
 		return this.kernel.evaluate(
 			`__import__('pi_ipython_state').${name}(*__import__('json').loads(${payload}))`,
 			options,

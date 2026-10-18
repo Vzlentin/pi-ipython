@@ -5,14 +5,16 @@ import {
 	formatSize as piFormatSize,
 	truncateTail as piTruncateTail,
 } from "@earendil-works/pi-coding-agent";
-import { formatSize, OUTPUT_MAX_BYTES, OUTPUT_MAX_LINES, truncateTail } from "../extensions/output.ts";
+import { formatSize, OUTPUT_MAX_BYTES, OUTPUT_MAX_LINES, stripAnsi, truncateTail } from "../extensions/output.ts";
 
 // output.ts copies Pi's truncation so that hosts without pi-coding-agent can use it. Both must cut output the same way.
 assert.equal(OUTPUT_MAX_LINES, DEFAULT_MAX_LINES);
+
 assert.equal(OUTPUT_MAX_BYTES, DEFAULT_MAX_BYTES);
 
 const lines = (count, text = "line") => Array.from({ length: count }, (_, index) => `${text} ${index}`).join("\n");
 const exactBytes = "x".repeat(DEFAULT_MAX_BYTES);
+
 const cases = {
 	empty: "",
 	"one line": "hello",
@@ -24,8 +26,16 @@ const cases = {
 	"far over the line limit": lines(DEFAULT_MAX_LINES * 3),
 	"bytes at the limit": exactBytes,
 	"one byte over the limit": `${exactBytes}x`,
-	"last two lines fill the limit exactly": ["c".repeat(10), "b".repeat(1000), "a".repeat(DEFAULT_MAX_BYTES - 1001)].join("\n"),
-	"last two lines one byte over the limit": ["c".repeat(10), "b".repeat(1000), "a".repeat(DEFAULT_MAX_BYTES - 1000)].join("\n"),
+	"last two lines fill the limit exactly": [
+		"c".repeat(10),
+		"b".repeat(1000),
+		"a".repeat(DEFAULT_MAX_BYTES - 1001),
+	].join("\n"),
+	"last two lines one byte over the limit": [
+		"c".repeat(10),
+		"b".repeat(1000),
+		"a".repeat(DEFAULT_MAX_BYTES - 1000),
+	].join("\n"),
 	// The byte limit is a multiple of 2 and 4, so these cuts start inside a character, counted from the end.
 	"cut inside a three-byte character": "€".repeat(DEFAULT_MAX_BYTES),
 	"cut inside a four-byte character": `${"😀".repeat(100)}${"x".repeat(DEFAULT_MAX_BYTES - 1)}`,
@@ -40,6 +50,7 @@ const cases = {
 for (const [name, content] of Object.entries(cases)) {
 	const expected = piTruncateTail(content);
 	const actual = truncateTail(content);
+
 	for (const field of ["content", "truncated", "totalLines", "totalBytes", "outputLines", "outputBytes"]) {
 		assert.equal(actual[field], expected[field], `${name}: ${field} differs from Pi's truncateTail`);
 	}
@@ -49,4 +60,38 @@ for (const bytes of [0, 1, 1023, 1024, 1025, 50 * 1024, 1024 * 1024 - 1, 1024 * 
 	assert.equal(formatSize(bytes), piFormatSize(bytes), `formatSize(${bytes})`);
 }
 
-console.log("output: truncation and sizes match Pi's on edge cases");
+// Expected values come from the regular expression that stripAnsi replaced:
+// \x1b(?:\][^\x07]*(?:\x07|\x1b\\)|[@-_][0-?]*[ -/]*[@-~]) with the g flag.
+const ansiCases = [
+	["plain text", "plain text"],
+	["\x1b[31mred\x1b[0m", "red"],
+	["\x1b[1;38;5;196mbold\x1b[22m", "bold"],
+	["\x1b[?25l\x1b[2J\x1b[H", ""],
+	["a\x1b[2 qb", "ab"],
+	["\x1b]0;title\x07after", "after"],
+	["\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\", ""],
+	["\x1b]0;one\x1b\\mid\x07end", "end"],
+	["\x1b]no terminator", "o terminator"],
+	["\x1b]a\x1b\\b\x1b\\c", "c"],
+	["\x1b]\x07x", "x"],
+	["\x1b]\x1b\\x", "x"],
+	["\x1b7saved\x1b8", "\x1b7saved\x1b8"],
+	["\x1bMup", "p"],
+	["\x1b(B", "\x1b(B"],
+	["\x1b[", "\x1b["],
+	["\x1b[12", "\x1b[12"],
+	["\x1b[1;2\x07", "\x1b[1;2\x07"],
+	["\x1b", "\x1b"],
+	["end\x1b", "end\x1b"],
+	["\x1b\x1b[0m", "\x1b"],
+	["\x1b`x", "\x1b`x"],
+	["\x1b~x", "\x1b~x"],
+	["\x1b\x7f", "\x1b\x7f"],
+	["\x9b31m", "\x9b31m"],
+	["\x1b[0m😀\x1b[1mé", "😀é"],
+	["line\n\x1b[Kline\r\n", "line\nline\r\n"],
+];
+
+for (const [input, expected] of ansiCases) assert.equal(stripAnsi(input), expected, JSON.stringify(input));
+
+console.log("output: truncation and sizes match Pi's on edge cases, ANSI stripping is unchanged");

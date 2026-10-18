@@ -11,14 +11,26 @@ import type * as Ai from "@earendil-works/pi-ai";
 import type * as Durable from "@earendil-works/pi-durable";
 import type { ConversationId, Cursor, Tx } from "@earendil-works/pi-durable";
 import { cellResult, DESCRIPTION } from "../extensions/cell.ts";
-import { describeError, KERNEL_STARTING_EVENT, type KernelHost } from "../extensions/kernel-runtime.ts";
+import { describeError, KERNEL_STARTING_EVENT, type KernelStartingEvent } from "../extensions/kernel-runtime.ts";
 import { OUTPUT_MAX_BYTES, OUTPUT_MAX_LINES } from "../extensions/output.ts";
 import { createRuntime, type Runtime } from "../extensions/persistence.ts";
+
+type Context = Parameters<Durable.ToolExecutionApi["agent"]>[0];
+
+/** The events this adapter emits on the host's bus. */
+export interface DurableEvents {
+	emit(name: typeof KERNEL_STARTING_EVENT, data: KernelStartingEvent & { conversationId: ConversationId }): void;
+	emit(
+		name: "ipython:cell-start",
+		data: { conversationId: ConversationId; api: Durable.ToolExecutionApi; context: Context },
+	): void;
+	emit(name: "ipython:cell-end", data: { conversationId: ConversationId }): void;
+}
 
 export interface DurableHost {
 	readonly durable: typeof Durable;
 	readonly ai: typeof Ai;
-	readonly events: KernelHost["events"];
+	readonly events: DurableEvents;
 }
 
 export const CHECKPOINT_ENTRY_KIND = "pi-ipython.checkpoint";
@@ -36,11 +48,14 @@ export default function ipython({ durable, ai, events }: DurableHost) {
 	async function checkpointIds(tx: Tx, conversationId: ConversationId): Promise<string[]> {
 		const ids: string[] = [];
 		let cursor: Cursor | undefined;
+
 		do {
 			const page = await tx.scanEntries({ conversationId, order: "descending" }, 256, cursor);
+
 			for (const entry of page.items) if (CheckpointEntry.is(entry)) ids.push(entry.data.checkpoint);
 			cursor = page.next;
 		} while (cursor !== undefined);
+
 		return ids;
 	}
 
@@ -52,7 +67,7 @@ export default function ipython({ durable, ai, events }: DurableHost) {
 		// Keep equal to `outputSchema` in extensions/ipython.ts; this module cannot import it.
 		structuredOutputSchema: ai.Type.Object({
 			status: ai.Type.Union([ai.Type.Literal("ok"), ai.Type.Literal("error")], {
-				description: "\"error\" when the cell raised or was interrupted",
+				description: '"error" when the cell raised or was interrupted',
 			}),
 			output: ai.Type.String({ description: "Streams, display output and tracebacks, without ANSI codes" }),
 			executionCount: ai.Type.Optional(ai.Type.Integer()),
@@ -68,39 +83,57 @@ export default function ipython({ durable, ai, events }: DurableHost) {
 		async execute(args, api, context) {
 			const signal = context.abortSignal;
 			const { cwd = process.cwd() } = await api.agent(context);
+
 			if (closing) throw new Error("IPython runtime is shutting down");
 			const { conversationId } = api;
 			const key = String(conversationId);
 			events.emit("ipython:cell-start", { conversationId, api, context });
+
 			try {
 				let runtime = runtimes.get(key);
+
 				if (!runtime) {
-					const emit = (name: string, data: unknown) => {
-						if (name === KERNEL_STARTING_EVENT) Object.assign(data as object, { conversationId });
-						return events.emit(name, data);
-					};
-					runtimes.set(key, runtime = createRuntime({ events: { emit } }, cwd));
+					const emit = (name: typeof KERNEL_STARTING_EVENT, data: KernelStartingEvent) =>
+						events.emit(name, Object.assign(data, { conversationId }));
+
+					runtimes.set(key, (runtime = createRuntime({ events: { emit } }, cwd)));
 				}
+
 				const { kernel, checkpoints } = runtime;
 
 				const candidates = await api.commit((tx) => checkpointIds(tx, api.conversationId), context);
 				const notices = await checkpoints.sync(candidates, cwd, signal, () => {});
 				let streamed = "";
-				const execution = await kernel.execute(api.callId, args.code, cwd, signal, () => {}, (output) => {
-					// Running output for viewers. api.output only appends, so after a clear they see the old output, then the new.
-					api.output(output.startsWith(streamed) ? output.slice(streamed.length) : output);
-					streamed = output;
-				});
+
+				const execution = await kernel.execute(
+					api.callId,
+					args.code,
+					cwd,
+					signal,
+					() => {},
+					(output) => {
+						// Running output for viewers. api.output only appends, so after a clear they see the old output, then the new.
+						api.output(output.startsWith(streamed) ? output.slice(streamed.length) : output);
+						streamed = output;
+					},
+				);
+
 				const checkpoint = checkpoints.save();
+
 				if (checkpoint !== undefined) {
-					await api.commit((tx) => tx.appendEntry(CheckpointEntry, api.conversationId, { data: { checkpoint } }), context);
+					await api.commit(
+						(tx) => tx.appendEntry(CheckpointEntry, api.conversationId, { data: { checkpoint } }),
+						context,
+					);
 				}
 
 				// Resets, restores and the truncation line are remarks for the model, which the harness renders after the output.
 				const { data, header } = cellResult(execution, notices, (text) => kernel.saveOutput(text));
 				const diagnostics: Durable.ToolDiagnostic[] = data.notices.map((message) => ({ severity: "info", message }));
+
 				if (header) diagnostics.push({ severity: "info", code: "output_truncated", message: header });
 				const text = data.output || (data.status === "error" && describeError(execution.result.error)) || "[no output]";
+
 				return {
 					output: [{ type: "text", text }],
 					structuredOutput: data,
@@ -122,8 +155,10 @@ export default function ipython({ durable, ai, events }: DurableHost) {
 				const results = await Promise.allSettled([...runtimes.values()].map((runtime) => runtime.close()));
 				runtimes.clear();
 				const errors = results.flatMap((result) => (result.status === "rejected" ? [result.reason] : []));
+
 				if (errors.length > 0) throw new AggregateError(errors, "Some IPython kernels did not stop");
 			})();
+
 			return closing;
 		},
 	};
