@@ -235,8 +235,8 @@ export class KernelRuntime {
 	private readonly bridgeCommand: readonly [string, ...string[]];
 
 	/**
-	 * `startupCode` runs hidden after every listener's snippets on each kernel start. `bridgeCommand` is the program and
-	 * arguments that start the bridge.
+	 * `startupCode` runs hidden after every listener's snippets and the `hs` import on each kernel start.
+	 * `bridgeCommand` is the program and arguments that start the bridge.
 	 */
 	constructor(
 		host: KernelHost,
@@ -414,6 +414,7 @@ export class KernelRuntime {
 			"import sys",
 			"assert sys.version_info[:2] == (3, 12)",
 			"import IPython, ipykernel, jupyter_client, zmq, cloudpickle",
+			"import pandas, python_calamine, xlsxwriter",
 		].join("; ");
 
 		const check = await execProcess(PYTHON_PATH, ["-I", "-c", validation], { signal, timeout: 15_000 });
@@ -428,7 +429,7 @@ export class KernelRuntime {
 			"set -eu",
 			`if ${shellQuote(PYTHON_PATH)} -I -c ${shellQuote(validation)} >/dev/null 2>&1; then exit 0; fi`,
 			`uv venv --no-project --no-config --managed-python --clear --python 3.12 ${shellQuote(RUNTIME_DIR)}`,
-			`uv pip install --no-config --strict --python ${shellQuote(PYTHON_PATH)} 'ipykernel>=7,<8' 'jupyter-client>=8,<9' 'cloudpickle>=3,<4'`,
+			`uv pip install --no-config --strict --python ${shellQuote(PYTHON_PATH)} 'ipykernel>=7,<8' 'jupyter-client>=8,<9' 'cloudpickle>=3,<4' 'pandas[excel]>=3,<4'`,
 			`${shellQuote(PYTHON_PATH)} -I -c ${shellQuote(validation)}`,
 		].join("\n");
 
@@ -470,6 +471,8 @@ export class KernelRuntime {
 		starting.startupCode.push(
 			`__import__('sys').path.insert(0, ${JSON.stringify(join(EXTENSION_DIR, "kernel"))})`,
 			"__import__('pi_ipython_interrupt').install(get_ipython().kernel)",
+			"import headstart as hs",
+			"hs.install(get_ipython())",
 			...this.startupCode,
 		);
 

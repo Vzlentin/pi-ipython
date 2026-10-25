@@ -13,8 +13,9 @@ Requirements:
 - macOS or Linux, with Bash and `lockf` (macOS) or `flock` (Linux).
 - Node.js 22.19 or newer, npm, Git, and Pi (tested with 1.2.0).
 - `uv` on `PATH`. The first tool call provisions an extension-owned Python 3.12
-  runtime with ipykernel, jupyter-client, and cloudpickle in `extensions/.python`,
-  so it needs network access.
+  runtime in `extensions/.python`, so it needs network access. The runtime has
+  ipykernel, jupyter-client, cloudpickle, pandas (with numpy), and the Excel
+  engines python-calamine, xlsxwriter, openpyxl, xlrd, pyxlsb, and odfpy.
 
 ```bash
 pi install https://github.com/Vzlentin/pi-ipython
@@ -50,6 +51,31 @@ also emits two events on the host's bus:
   conversation owned by `api.taskId`.
 - `ipython:cell-end` with `{ conversationId }`, after the cell ends, also when it raises, is cancelled or loses its
   kernel.
+
+## Load and save files
+
+Every kernel starts with `headstart` imported as `hs`, which has five functions. `hs` is a startup name, so checkpoints do not save it. Do not use `hs` as a variable: a rebound `hs` is not saved and is not cleared on restore.
+
+The `ipython` tool description carries the `hs` card, and tells agents to use the `write` and `edit` tools for files and `bash` for commands, tests and searches.
+
+```python
+df = hs.charge("data.xlsx", sheet="B")  # also .csv, .json, .jsonl, .toml, .xlsm, .xls, .xlsb, .ods, or a list of records
+hs.sauve("out.xlsx", {"First": df, "Second": other})  # also .json, .jsonl, .csv
+```
+
+- `charge` keeps codes with leading zeros, such as `00042`, as text in csv and spreadsheet files. It prints the
+  number of bad lines it skips in a jsonl file, and the names of the other sheets in a workbook. Only a workbook
+  takes `sheet`.
+- `sauve` writes a DataFrame, a list of records, or a plain value for `.json`. An xlsx file gets one sheet per key
+  of a dict, a frozen header row, a filter, and column widths that fit the content. `.jsonl`, `.csv` and `.xlsx`
+  need a DataFrame or records. It does not write text or other formats: use Pi's `write` tool for those.
+- `montre(x, n=40)` prints a short view of `x` and returns `x`. A frame or series with more than `n` rows shows its
+  first and last rows and the number of hidden rows. Long text or a long `repr` keeps its head and tail. As the last
+  line of a cell, the view is shown once, not twice.
+- `combien(df, key, *keys, n=20)` counts rows by one or more keys, with missing values counted as a value. It gives
+  the `n` most common groups, with the count `n` and its `share`, a fraction from 0 to 1.
+- `compare(a, b, key)` lists the rows that differ between two frames on a key or a list of keys, with `state`
+  `only a`, `only b` or `changed`. Missing values on both sides count as equal. A duplicate key raises an error.
 
 ## Cells in Herdr
 
@@ -88,7 +114,7 @@ The result after a restore reports its source cell, restored names, and skipped 
 Checkpointing is best-effort:
 
 - Module aliases are re-imported. Cell-defined functions and classes are saved by value with cloudpickle, and restored functions use the current kernel globals.
-- Names beginning with `_`, IPython internals, startup names supplied by extensions, and live files, sockets, generators, coroutines, and tasks are not saved.
+- Names beginning with `_`, IPython internals, startup names such as `hs` and those supplied by extensions, and live files, sockets, generators, coroutines, and tasks are not saved.
 - Values are limited to **64 MiB each** and **256 MiB of pickled data per cell**. Separate names are serialized independently, so aliases can restore as separate objects even though unchanged serialized content is deduplicated on disk.
 - Files written by cells are not rewound. Neither are live resources or process state such as `sys.path`, `os.environ`, the working directory, monkeypatches, imported module globals, or threads.
 - Input entered directly in `/cells` is included in the next Pi cell's checkpoint. If you navigate before another Pi cell, that console-only input is not followed to the other branch.

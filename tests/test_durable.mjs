@@ -129,8 +129,9 @@ try {
 	try {
 		const id = String(host.conversation.id);
 		let from = seen.length;
-		const first = await cell(host.conversation, "x = 41");
+		const first = await cell(host.conversation, "x = 41\nprint(hs.__name__)");
 		assert.equal(first.isError, false, first.text);
+		assert.match(first.text, /^headstart$/m);
 		assert.deepEqual(
 			seen.slice(from),
 			[
