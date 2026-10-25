@@ -414,10 +414,10 @@ print('saved')`);
 	extension = createExtensionHarness({ root, sessionManager: manager, startup });
 
 	const restored = await extension.cell(
-		"print(value, items[1]['answer'], mm.sqrt(16), box.answer(), locked(), recurse(5), closure(), next(iter(functions))(), partial(), startup_value, '_private' in globals(), 'handle' in globals(), 'sock' in globals(), delayed)",
+		"print(value, items[1]['answer'], mm.sqrt(16), box.answer(), locked(), recurse(5), closure(), next(iter(functions))(), partial(), startup_value, '_private' in globals(), 'handle' in globals(), 'sock' in globals(), delayed, hs.__name__)",
 	);
 
-	assert.match(restored.text, /41 42 4\.0 42 False 120 43 41 41 99 False False False 42/);
+	assert.match(restored.text, /41 42 4\.0 42 False 120 43 41 41 99 False False False 42 headstart/);
 	assert.match(restored.text, /ipython_state_restored/);
 	assert.match(restored.text, /generator .*live generator/i);
 	assert.match(restored.text, /handle .*live file resource/i);
@@ -442,6 +442,14 @@ print('saved')`);
 			const path = join(directory, name);
 
 			if (lstatSync(path).isFile()) assert.equal(lstatSync(path).mode & 0o777, 0o600);
+
+			if (directory.endsWith("manifests")) {
+				const { saved } = JSON.parse(readFileSync(path, "utf8"));
+				assert.equal(
+					saved.some((entry) => entry.name === "hs"),
+					false,
+				);
+			}
 		}
 	}
 

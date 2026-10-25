@@ -41,6 +41,7 @@ try {
 	const one = await runKernel(plain, "import os\nvalue = 41\nprint(os.getcwd())", first);
 	assert.equal(one.result.status, "ok");
 	assert.equal(one.result.output.trim(), first);
+
 	const two = await runKernel(plain, "print(value + 1, os.getcwd())", second);
 	assert.equal(two.result.output.trim(), `42 ${second}`);
 	const failed = await runKernel(plain, "raise ValueError('fixture')", second);
@@ -143,23 +144,23 @@ let beforeCrash;
 try {
 	const seen = await runKernel(
 		hooked,
-		"import os\nprint(hook_value, after_hook, os.environ['PI_IPYTHON_HOOK'])",
+		"import os\nprint(hook_value, after_hook, os.environ['PI_IPYTHON_HOOK'], all(map(callable, (hs.charge, hs.sauve, hs.montre, hs.combien, hs.compare))))",
 		first,
 	);
 
-	assert.equal(seen.result.output.trim(), "1 10 env-1");
+	assert.equal(seen.result.output.trim(), "1 10 env-1 True");
 	assert.equal(process.env.PI_IPYTHON_HOOK, undefined);
 	beforeCrash = hooked.saveOutput("saved before the crash\n");
 	await assert.rejects(runKernel(hooked, "os._exit(1)", first), /kernel state was lost/);
 
 	const again = await runKernel(
 		hooked,
-		"import os\nprint(hook_value, after_hook, os.environ['PI_IPYTHON_HOOK'])",
+		"import os\nprint(hook_value, after_hook, os.environ['PI_IPYTHON_HOOK'], all(map(callable, (hs.charge, hs.sauve, hs.montre, hs.combien, hs.compare))))",
 		first,
 	);
 
 	assert.equal(again.kernelReset, true);
-	assert.equal(again.result.output.trim(), "2 20 env-2");
+	assert.equal(again.result.output.trim(), "2 20 env-2 True");
 	assert.equal(readFileSync(beforeCrash, "utf8"), "saved before the crash\n");
 	// Shutdown also removes saved output when no kernel remains.
 	await assert.rejects(runKernel(hooked, "os._exit(1)", first), /kernel state was lost/);
