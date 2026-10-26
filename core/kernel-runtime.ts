@@ -1,13 +1,11 @@
 import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, isAbsolute, join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { createInterface } from "node:readline";
-import { fileURLToPath } from "node:url";
 import { formatSize, partialText, stripAnsi } from "./output.ts";
-import { PYTHON_PATH, syncEnvironment } from "./python.ts";
+import { CORE_DIR, PYTHON_PATH, syncEnvironment } from "./python.ts";
 
-const CORE_DIR = dirname(fileURLToPath(import.meta.url));
 const BRIDGE_PATH = join(CORE_DIR, "bridge.py");
 
 // The modules that the kernel imports at startup, such as `headstart`.

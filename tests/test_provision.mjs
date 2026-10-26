@@ -9,7 +9,7 @@ const python = fileURLToPath(new URL("../core/.python/bin/python", import.meta.u
 const sitePackages = fileURLToPath(new URL("../core/.python/lib/python3.12/site-packages", import.meta.url));
 const cwd = realpathSync(mkdtempSync(join(tmpdir(), "pi-ipython-provision-")));
 const restoreEnvironment = preserveEnvironment("PATH", "UV_OFFLINE", "UV_NO_CACHE");
-const kernels = [createKernel(), createKernel(), createKernel(), createKernel(), createKernel()];
+const kernels = [createKernel(), createKernel(), createKernel(), createKernel(), createKernel(), createKernel()];
 
 // A package that is not in uv.lock, as an agent installs it. It is written by hand, so it needs no package index.
 const installExtra = () => {
@@ -64,6 +64,18 @@ try {
 	await assert.rejects(start(kernels[4]), /Failed to provision the Python environment with uv:\n[^]*xlsxwriter/);
 	restoreEnvironment();
 	assert.deepEqual(await start(kernels[4]), { output: "xlsxwriter\n", provisioned: true });
+
+	// A cancel during the sync reports a cancellation, not a uv failure, and the same runtime recovers.
+	const undo = await execShim("uv", ["pip", "uninstall", "--python", python, "xlsxwriter"]);
+	assert.equal(undo.code, 0, undo.stderr);
+	const controller = new AbortController();
+
+	await assert.rejects(
+		runKernel(kernels[5], "print(1)", cwd, { signal: controller.signal, onProgress: () => controller.abort() }),
+		/^Error: Python environment provisioning cancelled$/,
+	);
+
+	assert.deepEqual(await start(kernels[5]), { output: "xlsxwriter\n", provisioned: true });
 } finally {
 	restoreEnvironment();
 	await Promise.all(kernels.map((kernel) => kernel.shutdown()));
@@ -72,5 +84,5 @@ try {
 }
 
 console.log(
-	"provision: concurrent hosts sync drift and keep extra packages, a synced environment is kept, a missing uv and a failed sync recover",
+	"provision: concurrent hosts sync drift and keep extra packages, a synced environment is kept, a missing uv, a failed sync and a cancelled sync recover",
 );

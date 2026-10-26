@@ -4,10 +4,11 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 // pyproject.toml and uv.lock in this directory define the Python environment; uv installs it in .python.
-const CORE_DIR = dirname(fileURLToPath(import.meta.url));
+export const CORE_DIR = dirname(fileURLToPath(import.meta.url));
 const PYTHON_DIR = join(CORE_DIR, ".python");
 const SYNC_TIMEOUT_MS = 6 * 60_000;
 const CHECK_TIMEOUT_MS = 15_000;
+const CANCELLED = "Python environment provisioning cancelled";
 const execFileAsync = promisify(execFile);
 
 export const PYTHON_PATH = join(PYTHON_DIR, "bin", "python");
@@ -23,7 +24,7 @@ function uv(args: string[], timeout: number, signal: AbortSignal | undefined) {
 }
 
 /**
- * Makes the Python environment contain the packages of uv.lock, and syncs it with uv when it does not.
+ * Syncs the Python environment with uv.lock when the offline check finds drift.
  * Packages that are not in uv.lock stay, so packages that an agent installs survive other sessions.
  */
 export async function syncEnvironment(
@@ -39,7 +40,7 @@ export async function syncEnvironment(
 
 		return;
 	} catch {
-		if (signal?.aborted) throw new Error("Python environment provisioning cancelled");
+		if (signal?.aborted) throw new Error(CANCELLED);
 	}
 
 	onProgress("Provisioning the extension-owned Python 3.12 environment with uv...");
@@ -47,6 +48,7 @@ export async function syncEnvironment(
 	try {
 		await uv(sync, SYNC_TIMEOUT_MS, signal);
 	} catch (error) {
+		if (signal?.aborted) throw new Error(CANCELLED);
 		const message = error instanceof Error ? error.message : String(error);
 		throw new Error(`Failed to provision the Python environment with uv:\n${message}`);
 	}
