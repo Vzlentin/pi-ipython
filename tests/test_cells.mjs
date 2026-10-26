@@ -322,7 +322,7 @@ try {
 
 		return {
 			kernelReset: true,
-			result: { status: "ok", executionCount: 1, output: "streamed output\n" },
+			result: { status: "ok", executionCount: 1, output: "streamed output\n", images: [], imagesDropped: 0 },
 		};
 	};
 
@@ -359,7 +359,7 @@ try {
 	// A failed removal of saved output is reported, and the console still closes.
 	KernelRuntime.prototype.execute = async () => ({
 		kernelReset: false,
-		result: { status: "ok", executionCount: 4, output: "line\n".repeat(3000) },
+		result: { status: "ok", executionCount: 4, output: "line\n".repeat(3000), images: [], imagesDropped: 0 },
 	});
 	const long = await tool.execute("long", { code: "print('line\\n' * 3000, end='')" }, undefined, () => {}, ctx);
 	outputDirectory = dirname(long.details.fullOutputPath);

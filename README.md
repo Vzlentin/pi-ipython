@@ -25,6 +25,12 @@ pi install https://github.com/Vzlentin/pi-ipython
 For development, from a clone: `npm install`, `npm test`, then run
 `pi -ne -e ./extensions/ipython.ts` for an isolated session.
 
+The kernel always uses matplotlib's inline backend, even when `MPLBACKEND` is
+set. The figures that a cell shows reach the runtime as base64 PNGs in
+`BridgeResult.images`, up to 4 figures and 8 MiB for each cell. `BridgeResult.imagesDropped` counts the other
+figures. The tool result gives the figures to the model as PNG image content after the text. When the cell
+dropped figures, a text part after the images tells the model how many it did not get.
+
 ## Extending the kernel
 
 Before every kernel start (including restarts), the extension emits
@@ -55,21 +61,21 @@ also emits two events on the host's bus:
 
 ## Load and save files
 
-Every kernel starts with `headstart` imported as `hs`, which has five functions. `hs` is a startup name, so checkpoints do not save it. Do not use `hs` as a variable: a rebound `hs` is not saved and is not cleared on restore.
+Every kernel starts with `headstart` imported as `hs`, which has nine functions. `hs` is a startup name, so checkpoints do not save it. Do not use `hs` as a variable: a rebound `hs` is not saved and is not cleared on restore.
 
 The `ipython` tool description carries the `hs` card, and tells agents to use the `write` and `edit` tools for files and `bash` for commands, tests and searches.
 
 ```python
-df = hs.charge("data.xlsx", sheet="B")  # also .csv, .json, .jsonl, .toml, .xlsm, .xls, .xlsb, .ods, or a list of records
-hs.sauve("out.xlsx", {"First": df, "Second": other})  # also .json, .jsonl, .csv
+df = hs.charge("data.xlsx", sheet="B")  # also .csv, .json, .jsonl, .toml, .parquet, .xlsm, .xls, .xlsb, .ods, or a list of records
+hs.sauve("out.xlsx", {"First": df, "Second": other})  # also .json, .jsonl, .csv, .parquet
 ```
 
 - `charge` keeps codes with leading zeros, such as `00042`, as text in csv and spreadsheet files. It prints the
   number of bad lines it skips in a jsonl file, and the names of the other sheets in a workbook. Only a workbook
   takes `sheet`.
 - `sauve` writes a DataFrame, a list of records, or a plain value for `.json`. An xlsx file gets one sheet per key
-  of a dict, a frozen header row, a filter, and column widths that fit the content. `.jsonl`, `.csv` and `.xlsx`
-  need a DataFrame or records. It does not write text or other formats: use Pi's `write` tool for those.
+  of a dict, a frozen header row, a filter, and column widths that fit the content. `.jsonl`, `.csv`, `.xlsx` and
+  `.parquet` need a DataFrame or records. It does not write text or other formats: use Pi's `write` tool for those.
 - `montre(x, n=40)` prints a short view of `x` and returns `x`. A frame or series with more than `n` rows shows its
   first and last rows and the number of hidden rows. Long text or a long `repr` keeps its head and tail. As the last
   line of a cell, the view is shown once, not twice.
@@ -77,6 +83,24 @@ hs.sauve("out.xlsx", {"First": df, "Second": other})  # also .json, .jsonl, .csv
   the `n` most common groups, with the count `n` and its `share`, a fraction from 0 to 1.
 - `compare(a, b, key)` lists the rows that differ between two frames on a key or a list of keys, with `state`
   `only a`, `only b` or `changed`. Missing values on both sides count as equal. A duplicate key raises an error.
+- `interroge(sql, cap=None)` runs a BigQuery query. It needs `GOOGLE_APPLICATION_CREDENTIALS` and
+  `CLOUDSDK_CORE_PROJECT` in the environment, so start Pi in a folder whose environment sets them. It always does a
+  dry run first. With no cap, it prints the statement type and the estimated bytes, and runs nothing. With a cap, it
+  refuses an estimate above the cap, and else runs the query billed at most the cap and returns a DataFrame. A cap
+  is an int of bytes, or text such as `"20 GB"` in decimal units (B, KB, MB, GB, TB).
+- `joins(a, b, key, how="left", validate=None)` merges two frames on a key or a list of keys and returns the result.
+  It prints the rows of `a` whose key is in `b` (matched), the rows of `a` whose key is not in `b` (only a), and the
+  rows of `b` whose key is not in `a` (only b). Before it merges, a left or inner join raises an error when a key of
+  `a` repeats in `b`, because the join would give more rows than `a`. The error names up to 10 of these keys. Pass
+  `validate=`, as in pandas `merge`, to allow it. Right and outer joins are not checked.
+- `decris(df)` returns one row for each column of `df`: the type, the share of missing values, the count of distinct
+  values, the 3 most common values, and the min and max. Missing values do not count in distinct or top values. The
+  min and max are empty when the column mixes types that do not compare, such as numbers and text. The distinct
+  and top values are empty when the cells are lists, dicts or arrays.
+- `verifie(checks)` runs every check of a dict of names and conditions. It prints `passed <name>` or
+  `failed <name>` for each one, and returns `None` when all pass. Else, after all checks ran, it raises one
+  `AssertionError` that names every failed check. Each condition must be one `True` or `False`, such as
+  `(df.x > 0).all()`. Any other value, such as a Series, raises a `TypeError` before any check runs.
 
 ## Cells in Herdr
 
@@ -167,6 +191,8 @@ await tool.close();
   a crash, restores the latest checkpoint of its own history, with the same notices as in Pi.
 - The output of a result is the output tail. Kernel resets, checkpoint restores and the line that names the file
   with the full output are diagnostics, which the harness shows after it.
+- A result gives the cell's figures as PNG image content after the output text, as in Pi, with the same text part
+  for dropped figures.
 - The kernel-starting event names the conversation, and each cell emits `ipython:cell-start` and `ipython:cell-end`.
   See [Extending the kernel](#extending-the-kernel).
 - Results have structured output: the `CellResult`, as in Pi. A tool that runs a cell through `api.executeTool`

@@ -1,19 +1,28 @@
 """Load, save and inspect common data in one call.
 
-`charge` reads a file into a DataFrame or a plain value. `sauve` writes a
-DataFrame, a list of records or a plain value to a file. `montre` prints a
-short view of a value, `combien` counts rows by key, and `compare` lists the
-rows that differ between two frames. Every verb also takes records, a list of
-dicts.
+Files: `charge` reads a file into a DataFrame or a plain value. `sauve`
+writes a DataFrame, a list of records or a plain value to a file.
+
+Frames: `montre` prints a short view of a value. `combien` counts rows by key.
+`compare` lists the rows that differ between two frames. `joins` merges two
+frames and refuses a merge that multiplies rows. `decris` profiles each
+column. Every frame verb also takes records, a list of dicts.
+
+Checks and queries: `verifie` runs named checks and raises once with every
+failed name. `interroge` runs a BigQuery query after a dry run, within a byte
+cap.
 """
 import json
+import os
 import re
 import tomllib
+from decimal import Decimal
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
-__all__ = ["charge", "sauve", "montre", "combien", "compare"]
+__all__ = ["charge", "sauve", "montre", "combien", "compare", "joins", "decris", "interroge", "verifie"]
 
 EXCEL_SUFFIXES = {".xlsx", ".xlsm", ".xls", ".xlsb", ".ods"}
 LEADING_ZERO = re.compile(r"^[+-]?0\d")
@@ -21,6 +30,8 @@ LEADING_ZERO = re.compile(r"^[+-]?0\d")
 MAX_COLUMN_WIDTH = 60
 # Text budget of one row of n in montre, in characters.
 CHARACTERS_PER_ROW = 80
+# Decimal byte units of an interroge cap, largest first.
+UNITS = {"TB": 10**12, "GB": 10**9, "MB": 10**6, "KB": 10**3, "B": 1}
 _shell = None
 _shown = None
 
@@ -136,6 +147,10 @@ def _charge_toml(path):
         return tomllib.load(file)
 
 
+def _charge_parquet(path):
+    return pd.read_parquet(path, engine="pyarrow")
+
+
 def _charge_excel(path, sheet):
     with pd.ExcelFile(path, engine="calamine") as book:
         name = book.sheet_names[0] if sheet is None else sheet
@@ -147,11 +162,17 @@ def _charge_excel(path, sheet):
         return pd.read_excel(book, sheet_name=name, dtype=object).infer_objects()
 
 
-READERS = {".jsonl": _charge_jsonl, ".csv": _charge_csv, ".json": _charge_json, ".toml": _charge_toml}
+READERS = {
+    ".jsonl": _charge_jsonl,
+    ".csv": _charge_csv,
+    ".json": _charge_json,
+    ".toml": _charge_toml,
+    ".parquet": _charge_parquet,
+}
 
 
 def sauve(path, data):
-    """Write data to a .json, .jsonl, .csv or .xlsx file and return its path."""
+    """Write data to a .json, .jsonl, .csv, .xlsx or .parquet file and return its path."""
     if isinstance(data, str):
         raise TypeError("sauve does not write text: use Pi's write tool")
 
@@ -183,6 +204,10 @@ def _sauve_csv(path, data):
     _frame(data, "sauve .csv").to_csv(path, index=False)
 
 
+def _sauve_parquet(path, data):
+    _frame(data, "sauve .parquet").to_parquet(path, engine="pyarrow", index=False)
+
+
 def _sauve_xlsx(path, data):
     if isinstance(data, dict):
         sheets = {name: _frame(_records(sheet), f"sauve .xlsx sheet {name!r}") for name, sheet in data.items()}
@@ -201,7 +226,13 @@ def _sauve_xlsx(path, data):
                 sheet.set_column(index, index, min(width + 2, MAX_COLUMN_WIDTH))
 
 
-WRITERS = {".json": _sauve_json, ".jsonl": _sauve_jsonl, ".csv": _sauve_csv, ".xlsx": _sauve_xlsx}
+WRITERS = {
+    ".json": _sauve_json,
+    ".jsonl": _sauve_jsonl,
+    ".csv": _sauve_csv,
+    ".xlsx": _sauve_xlsx,
+    ".parquet": _sauve_parquet,
+}
 
 
 def montre(x, n=40):
@@ -253,3 +284,122 @@ def compare(a, b, key):
     merged.insert(0, "state", state)
 
     return merged[differs].reset_index()
+
+
+def joins(a, b, key, how="left", validate=None):
+    """Merge a and b on key, print matched, only a and only b rows, and refuse more rows than a unless validate is set."""
+    a = _frame(_records(a), "joins")
+    b = _frame(_records(b), "joins")
+    ia = a.set_index(key).index
+    ib = b.set_index(key).index
+    matched = ia.isin(ib)
+    print(f"matched {matched.sum():,}, only a {(~matched).sum():,}, only b {(~ib.isin(ia)).sum():,}")
+
+    # A left or inner join gives more rows than a only when a key of a repeats in b.
+    if validate is None and how in ("left", "inner"):
+        repeated = ib[ib.duplicated() & ib.isin(ia)].unique()
+
+        if len(repeated) > 0:
+            raise ValueError(
+                f"joins gives more rows than a: {len(repeated):,} keys repeat in b, "
+                f"such as {list(repeated[:10])}; pass validate= to allow it"
+            )
+
+    return a.merge(b, on=key, how=how, validate=validate)
+
+
+def decris(df):
+    """One row for each column of df: type, missing share, distinct count, top 3 values, min and max."""
+    frame = _frame(_records(df), "decris")
+    rows = []
+
+    for name, column in frame.items():
+        try:  # nunique raises on lists, dicts and arrays, which do not hash
+            distinct, counts = column.nunique(), column.value_counts()
+            top = counts[counts > 0].head(3).index.tolist()  # a category column also counts unused categories
+        except TypeError:
+            distinct = top = None
+
+        try:  # mixed types do not compare, and arrays raise ValueError
+            low, high = column.min(), column.max()
+        except (TypeError, ValueError):
+            low = high = None
+
+        rows.append({"column": name, "type": str(column.dtype), "missing": column.isna().mean(),
+                     "distinct": distinct, "top": top, "min": low, "max": high})
+
+    return pd.DataFrame(rows)
+
+
+def verifie(checks):
+    """Run every named check, print each one, and raise once with every failed name."""
+    for name, ok in checks.items():
+        if not isinstance(ok, (bool, np.bool_)):
+            raise TypeError(f"verifie needs True or False for each check, not {type(ok).__name__} for {name!r}: use .all()")
+
+    failed = []
+
+    for name, ok in checks.items():
+        print(f"{'passed' if ok else 'failed'} {name}")
+
+        if not ok:
+            failed.append(name)
+
+    if failed:
+        raise AssertionError(f"verifie failed: {', '.join(failed)}")
+
+
+def _bytes(cap):
+    if isinstance(cap, int):
+        return cap
+
+    match = re.fullmatch(r"(\d+(?:\.\d+)?)\s*([KMGT]?B)", str(cap), re.I)
+
+    if match is None:
+        raise ValueError(f"interroge needs a cap in bytes or text such as \"20 GB\", not {cap!r}")
+
+    number, unit = match.groups()
+
+    return int(Decimal(number) * UNITS[unit.upper()])
+
+
+def _size(n):
+    for unit, size in UNITS.items():
+        if n >= size > 1:
+            return f"{n / size:.1f} {unit}"
+
+    return f"{n} B"
+
+
+def interroge(sql, cap=None):
+    """Dry-run sql on BigQuery; with no cap print its type and estimate, else run it within cap and return a DataFrame."""
+    if not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS") or not os.environ.get("CLOUDSDK_CORE_PROJECT"):
+        raise RuntimeError(
+            "interroge needs GOOGLE_APPLICATION_CREDENTIALS and CLOUDSDK_CORE_PROJECT: "
+            "start Pi in a folder whose environment sets them"
+        )
+
+    # Lazy: the import costs each kernel about 70 ms and 32 MB, and most kernels never query BigQuery.
+    from google.cloud import bigquery
+
+    client = bigquery.Client(project=os.environ["CLOUDSDK_CORE_PROJECT"])
+    dry = client.query(sql, job_config=bigquery.QueryJobConfig(dry_run=True, use_query_cache=False))
+    kind = dry.statement_type
+    estimate = dry.total_bytes_processed
+
+    if cap is None:
+        print(f"{kind}, {_size(estimate)}")
+        return None
+
+    cap = _bytes(cap)
+
+    if estimate > cap:
+        raise ValueError(f"interroge refuses {kind}, {estimate:,} bytes: above the cap of {cap:,} bytes")
+
+    job = client.query(sql, job_config=bigquery.QueryJobConfig(maximum_bytes_billed=cap))
+
+    try:
+        return job.to_dataframe(create_bqstorage_client=False)
+    except KeyboardInterrupt:
+        job.cancel()
+        raise

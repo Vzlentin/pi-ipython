@@ -131,7 +131,26 @@ try {
 	const consecutive = await extension.cell("print(id(live_file) == live_identity)");
 	assert.match(consecutive.text, /True/);
 	assert.doesNotMatch(consecutive.text, /ipython_state_restored/);
+	assert.equal(consecutive.content.length, 1);
 	await extension.cell("live_file.close()");
+
+	// The figures that a cell shows reach the model as PNG image content after the text, up to 4 per cell.
+	const figure = await extension.cell("import matplotlib.pyplot as plt; plt.plot([1, 2])");
+	assert.equal(figure.content.length, 2);
+	assert.equal(figure.content[0].type, "text");
+	assert.equal(figure.content[1].type, "image");
+	assert.equal(figure.content[1].mimeType, "image/png");
+	assert.deepEqual(
+		[...Buffer.from(figure.content[1].data, "base64").subarray(0, 8)],
+		[0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a],
+	);
+
+	const six = await extension.cell("for i in range(6): plt.figure(figsize=(2 + i, 2)); plt.plot([0, i])");
+	assert.deepEqual(
+		six.content.map((part) => part.type),
+		["text", "image", "image", "image", "image", "text"],
+	);
+	assert.equal(six.content.at(-1).text, "2 figures not sent: the limit is 4 figures and 8.0MB per cell.");
 
 	// Cells that a codemode script runs share state with each other and with later direct cells.
 	const beforeScripts = extension.user("run a script");

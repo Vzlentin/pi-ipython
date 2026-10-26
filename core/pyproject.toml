@@ -8,4 +8,8 @@ dependencies = [
     "jupyter-client>=8,<9",
     "cloudpickle>=3,<4",
     "pandas[excel]>=3,<4",
+    "pyarrow>=26,<27",
+    "google-cloud-bigquery>=3,<4",
+    "db-dtypes>=1,<2",
+    "matplotlib>=3,<4",
 ]

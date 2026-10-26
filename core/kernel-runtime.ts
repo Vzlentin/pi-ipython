@@ -15,7 +15,11 @@ const STARTUP_TIMEOUT_MS = 45_000;
 const EVALUATE_TIMEOUT_MS = 60_000;
 export const OUTPUT_CAPTURE_LIMIT_BYTES = 1024 * 1024;
 export const INTERRUPT_GRACE_MS = 3_000;
-export const BRIDGE_PROTOCOL_VERSION = 2;
+export const BRIDGE_PROTOCOL_VERSION = 3;
+
+/** The most images that one cell keeps, in count and in base64 bytes. The cell counts the images past them as dropped. */
+export const IMAGE_LIMIT = 4;
+export const IMAGE_LIMIT_BYTES = 8 * 1024 * 1024;
 export const KERNEL_STARTING_EVENT = "ipython:kernel-starting";
 
 /**
@@ -45,6 +49,10 @@ export interface BridgeResult {
 	executionCount?: number;
 	error?: BridgeError;
 	output: string;
+	/** Base64 PNGs that the cell showed, in display order, within `IMAGE_LIMIT` and `IMAGE_LIMIT_BYTES`. */
+	images: string[];
+	/** The images that the cell showed past the limits. */
+	imagesDropped: number;
 }
 
 /** A JSON-decoded value. */
@@ -65,6 +73,7 @@ type BridgeMessage =
 	| { type: "fatal"; error: string; traceback: string }
 	| { type: "bridge_error"; request_id: string | null; error: string; traceback: string }
 	| { type: "clear"; request_id: string }
+	| { type: "image"; request_id: string; data: string }
 	| { type: "output"; request_id: string; kind: string; text: string; continuation: boolean; final: boolean }
 	| {
 			type: "result";
@@ -98,6 +107,8 @@ function isBridgeMessage(value: JsonValue): value is BridgeMessage {
 			);
 		case "clear":
 			return typeof value.request_id === "string";
+		case "image":
+			return typeof value.request_id === "string" && typeof value.data === "string";
 		case "output":
 			return (
 				typeof value.request_id === "string" &&
@@ -136,6 +147,7 @@ function invalidMessageReason(value: JsonValue): string | undefined {
 		case "fatal":
 		case "bridge_error":
 		case "clear":
+		case "image":
 		case "output":
 		case "result":
 			return `IPython bridge sent an invalid ${value.type} message`;
@@ -162,6 +174,8 @@ interface RequestOptions {
 interface ActiveExecution {
 	requestId: string;
 	output: string;
+	images: string[];
+	imagesDropped: number;
 	onOutput?: (output: string) => void;
 	resolve: (result: ProtocolResult) => void;
 	reject: (error: Error) => void;
@@ -292,6 +306,8 @@ export class KernelRuntime {
 			const active: ActiveExecution = {
 				requestId: message.request_id,
 				output: "",
+				images: [],
+				imagesDropped: 0,
 				onOutput: options.onOutput,
 				resolve,
 				reject,
@@ -567,7 +583,18 @@ export class KernelRuntime {
 
 		if (message.type === "clear") {
 			active.output = "";
+			active.images = [];
+			active.imagesDropped = 0;
 			active.onOutput?.(active.output);
+
+			return;
+		}
+
+		if (message.type === "image") {
+			const bytes = active.images.reduce((sum, image) => sum + image.length, message.data.length);
+
+			if (active.images.length < IMAGE_LIMIT && bytes <= IMAGE_LIMIT_BYTES) active.images.push(message.data);
+			else active.imagesDropped += 1;
 
 			return;
 		}
@@ -627,6 +654,8 @@ export class KernelRuntime {
 				value: message.value,
 				error: message.error ?? undefined,
 				output: active.output,
+				images: active.images,
+				imagesDropped: active.imagesDropped,
 			};
 
 			const reason = active.interrupt?.reason;
