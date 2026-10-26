@@ -10,12 +10,13 @@ runs in hosts built on pi-durable, see [pi-durable](#pi-durable).
 
 Requirements:
 
-- macOS or Linux, with Bash and `lockf` (macOS) or `flock` (Linux).
+- macOS or Linux.
 - Node.js 22.19 or newer, npm, Git, and Pi (tested with 1.2.0).
-- `uv` on `PATH`. The first tool call provisions an extension-owned Python 3.12
-  runtime in `extensions/.python`, so it needs network access. The runtime has
-  ipykernel, jupyter-client, cloudpickle, pandas (with numpy), and the Excel
-  engines python-calamine, xlsxwriter, openpyxl, xlrd, pyxlsb, and odfpy.
+- `uv` 0.7.12 or newer on `PATH`. Each session checks the extension-owned
+  Python 3.12 environment in `core/.python` with uv before its first kernel
+  starts. The first tool call provisions the environment, so it needs network
+  access. uv installs the packages of `core/pyproject.toml` at the versions of
+  `core/uv.lock`. Other packages that you install in the environment stay.
 
 ```bash
 pi install https://github.com/Vzlentin/pi-ipython

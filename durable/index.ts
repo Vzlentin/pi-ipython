@@ -10,10 +10,10 @@
 import type * as Ai from "@earendil-works/pi-ai";
 import type * as Durable from "@earendil-works/pi-durable";
 import type { ConversationId, Cursor, Tx } from "@earendil-works/pi-durable";
-import { cellResult, DESCRIPTION } from "../extensions/cell.ts";
-import { describeError, KERNEL_STARTING_EVENT, type KernelStartingEvent } from "../extensions/kernel-runtime.ts";
-import { OUTPUT_MAX_BYTES, OUTPUT_MAX_LINES } from "../extensions/output.ts";
-import { createRuntime, type Runtime } from "../extensions/persistence.ts";
+import { cellResult, DESCRIPTION } from "../core/cell.ts";
+import { describeError, KERNEL_STARTING_EVENT, type KernelStartingEvent } from "../core/kernel-runtime.ts";
+import { OUTPUT_MAX_BYTES, OUTPUT_MAX_LINES } from "../core/output.ts";
+import { createRuntime, type Runtime } from "../core/persistence.ts";
 
 type Context = Parameters<Durable.ToolExecutionApi["agent"]>[0];
 

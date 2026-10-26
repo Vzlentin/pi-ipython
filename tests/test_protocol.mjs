@@ -3,7 +3,7 @@ import { EventEmitter } from "node:events";
 import { mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { KernelLostError, KernelRuntime } from "../extensions/kernel-runtime.ts";
+import { KernelLostError, KernelRuntime } from "../core/kernel-runtime.ts";
 import { runKernel, waitFor } from "./helpers.mjs";
 
 // A bridge that speaks the stdio protocol without a kernel. PI_IPYTHON_FAKE_BRIDGE names the message to break, and

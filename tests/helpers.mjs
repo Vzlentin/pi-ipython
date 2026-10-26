@@ -2,8 +2,8 @@ import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { promisify } from "node:util";
+import { KernelRuntime } from "../core/kernel-runtime.ts";
 import ipythonExtension from "../extensions/ipython.ts";
-import { KernelRuntime } from "../extensions/kernel-runtime.ts";
 
 const execFileAsync = promisify(execFile);
 let toolIndex = 0;

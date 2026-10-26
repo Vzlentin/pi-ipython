@@ -1,18 +1,17 @@
-import { type ChildProcessWithoutNullStreams, execFile, spawn } from "node:child_process";
+import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, isAbsolute, join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { createInterface } from "node:readline";
-import { fileURLToPath } from "node:url";
 import { formatSize, partialText, stripAnsi } from "./output.ts";
+import { CORE_DIR, PYTHON_PATH, syncEnvironment } from "./python.ts";
 
-const EXTENSION_DIR = dirname(fileURLToPath(import.meta.url));
-const BRIDGE_PATH = join(EXTENSION_DIR, "bridge.py");
-const RUNTIME_DIR = join(EXTENSION_DIR, ".python");
-const PYTHON_PATH = join(RUNTIME_DIR, "bin", "python");
-const PROVISION_LOCK = join(EXTENSION_DIR, ".python.lock");
+const BRIDGE_PATH = join(CORE_DIR, "bridge.py");
+
+// The modules that the kernel imports at startup, such as `headstart`.
+const KERNEL_MODULES_DIR = join(CORE_DIR, "kernel");
+
 const STARTUP_TIMEOUT_MS = 45_000;
-const PROVISION_TIMEOUT_MS = 6 * 60_000;
 const EVALUATE_TIMEOUT_MS = 60_000;
 export const OUTPUT_CAPTURE_LIMIT_BYTES = 1024 * 1024;
 export const INTERRUPT_GRACE_MS = 3_000;
@@ -34,28 +33,6 @@ export interface KernelStartingEvent {
 /** The host's event bus, which receives `ipython:kernel-starting`: `pi.events` in Pi, the host's own bus elsewhere. */
 export interface KernelHost {
 	readonly events: { emit(name: typeof KERNEL_STARTING_EVENT, data: KernelStartingEvent): void };
-}
-
-/** Runs a program and reports a failure as its exit code, like Pi's `exec`. */
-function execProcess(
-	command: string,
-	args: string[],
-	options: { signal?: AbortSignal; timeout?: number; cwd?: string },
-): Promise<{ code: number; stdout: string; stderr: string }> {
-	return new Promise((resolve) => {
-		execFile(
-			command,
-			args,
-			{ cwd: options.cwd, signal: options.signal, timeout: options.timeout, maxBuffer: 16 * 1024 * 1024 },
-			(error, stdout, stderr) => {
-				// `code` is the exit code when the program ran, otherwise a Node error code such as ENOENT.
-				const exitCode = error !== null && Number.isInteger(error.code) ? Number(error.code) : undefined;
-				const code = error === null ? 0 : (exitCode ?? 1);
-				const message = error !== null && exitCode === undefined ? error.message : "";
-				resolve({ code, stdout: String(stdout), stderr: [String(stderr), message].filter(Boolean).join("\n") });
-			},
-		);
-	});
 }
 
 export interface BridgeError {
@@ -204,10 +181,6 @@ export function errorText(cause: unknown): string {
 
 export function describeError(error: BridgeError | undefined): string {
 	return [error?.ename, error?.evalue].filter(Boolean).join(": ");
-}
-
-export function shellQuote(value: string): string {
-	return `'${value.replaceAll("'", `'"'"'`)}'`;
 }
 
 export class KernelRuntime {
@@ -396,7 +369,7 @@ export class KernelRuntime {
 
 	private async ensureRuntime(signal: AbortSignal | undefined, onProgress: (message: string) => void): Promise<void> {
 		if (!this.provisioning) {
-			const provision = this.provision(signal, onProgress);
+			const provision = syncEnvironment(signal, onProgress);
 
 			const tracked = provision.catch((error) => {
 				if (this.provisioning === tracked) this.provisioning = undefined;
@@ -407,49 +380,6 @@ export class KernelRuntime {
 		}
 
 		await this.provisioning;
-	}
-
-	private async provision(signal: AbortSignal | undefined, onProgress: (message: string) => void): Promise<void> {
-		const validation = [
-			"import sys",
-			"assert sys.version_info[:2] == (3, 12)",
-			"import IPython, ipykernel, jupyter_client, zmq, cloudpickle",
-			"import pandas, python_calamine, xlsxwriter",
-		].join("; ");
-
-		const check = await execProcess(PYTHON_PATH, ["-I", "-c", validation], { signal, timeout: 15_000 });
-
-		if (check.code === 0) return;
-
-		if (signal?.aborted) throw new Error("IPython runtime provisioning cancelled");
-
-		onProgress("Provisioning extension-owned Python 3.12 and IPython runtime with uv...");
-
-		const script = [
-			"set -eu",
-			`if ${shellQuote(PYTHON_PATH)} -I -c ${shellQuote(validation)} >/dev/null 2>&1; then exit 0; fi`,
-			`uv venv --no-project --no-config --managed-python --clear --python 3.12 ${shellQuote(RUNTIME_DIR)}`,
-			`uv pip install --no-config --strict --python ${shellQuote(PYTHON_PATH)} 'ipykernel>=7,<8' 'jupyter-client>=8,<9' 'cloudpickle>=3,<4' 'pandas[excel]>=3,<4'`,
-			`${shellQuote(PYTHON_PATH)} -I -c ${shellQuote(validation)}`,
-		].join("\n");
-
-		const lockCommand = process.platform === "darwin" ? "lockf" : "flock";
-
-		const lockArgs =
-			process.platform === "darwin"
-				? ["-k", "-t", "300", PROVISION_LOCK, "bash", "-c", script]
-				: ["-w", "300", PROVISION_LOCK, "bash", "-c", script];
-
-		const result = await execProcess(lockCommand, lockArgs, {
-			signal,
-			timeout: PROVISION_TIMEOUT_MS,
-			cwd: EXTENSION_DIR,
-		});
-
-		if (result.code !== 0) {
-			const diagnostics = [result.stderr, result.stdout].filter(Boolean).join("\n").trim();
-			throw new Error(`Failed to provision the IPython runtime with uv${diagnostics ? `:\n${diagnostics}` : ""}`);
-		}
 	}
 
 	private async startKernel(
@@ -469,7 +399,7 @@ export class KernelRuntime {
 		this.host.events.emit(KERNEL_STARTING_EVENT, starting);
 		await Promise.all(waits);
 		starting.startupCode.push(
-			`__import__('sys').path.insert(0, ${JSON.stringify(join(EXTENSION_DIR, "kernel"))})`,
+			`__import__('sys').path.insert(0, ${JSON.stringify(KERNEL_MODULES_DIR)})`,
 			"__import__('pi_ipython_interrupt').install(get_ipython().kernel)",
 			"import headstart as hs",
 			"hs.install(get_ipython())",
