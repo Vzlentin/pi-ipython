@@ -4,9 +4,9 @@ import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync, wri
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
+import { KernelRuntime } from "../core/kernel-runtime.ts";
 import { CellsView } from "../extensions/cells.ts";
 import ipythonExtension from "../extensions/ipython.ts";
-import { KernelRuntime } from "../extensions/kernel-runtime.ts";
 
 const originalHerdr = process.env.HERDR_ENV;
 
@@ -119,7 +119,7 @@ try {
 	const command = calls.find((args) => args[1] === "run")[3];
 	assert.match(
 		command,
-		/; \/bin\/cat '[^']+'; exec 'env' 'JUPYTER_PATH=[^']+\/extensions\/\.python\/share\/jupyter' 'uv' 'tool' 'run' .*'--from' 'euporie==2\.10\.4' 'euporie-console' '--connection-file' /,
+		/; \/bin\/cat '[^']+'; exec 'env' 'JUPYTER_PATH=[^']+\/core\/\.python\/share\/jupyter' 'uv' 'tool' 'run' .*'--from' 'euporie==2\.10\.4' 'euporie-console' '--connection-file' /,
 	);
 	assert.match(
 		command,

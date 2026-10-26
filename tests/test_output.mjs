@@ -5,7 +5,7 @@ import {
 	formatSize as piFormatSize,
 	truncateTail as piTruncateTail,
 } from "@earendil-works/pi-coding-agent";
-import { formatSize, OUTPUT_MAX_BYTES, OUTPUT_MAX_LINES, stripAnsi, truncateTail } from "../extensions/output.ts";
+import { formatSize, OUTPUT_MAX_BYTES, OUTPUT_MAX_LINES, stripAnsi, truncateTail } from "../core/output.ts";
 
 // output.ts copies Pi's truncation so that hosts without pi-coding-agent can use it. Both must cut output the same way.
 assert.equal(OUTPUT_MAX_LINES, DEFAULT_MAX_LINES);

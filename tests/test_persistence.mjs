@@ -71,7 +71,7 @@ def stalled_shutdown(self, **kwargs):
     pathlib.Path(${JSON.stringify(ready)}).touch()
     time.sleep(60)
 KernelManager.shutdown_kernel = stalled_shutdown
-runpy.run_path(${JSON.stringify(fileURLToPath(new URL("../extensions/bridge.py", import.meta.url)))}, run_name='__main__')`;
+runpy.run_path(${JSON.stringify(fileURLToPath(new URL("../core/bridge.py", import.meta.url)))}, run_name='__main__')`;
 
 	const stalledLaunch = `
 import json, os, pathlib, runpy, signal, time
@@ -88,12 +88,12 @@ def stalled_launch(*args, **kwargs):
     time.sleep(60)
     return process
 local_provisioner.launch_kernel = stalled_launch
-runpy.run_path(${JSON.stringify(fileURLToPath(new URL("../extensions/bridge.py", import.meta.url)))}, run_name='__main__')`;
+runpy.run_path(${JSON.stringify(fileURLToPath(new URL("../core/bridge.py", import.meta.url)))}, run_name='__main__')`;
 
 	const hostCode = ["cleanup", "launch"].includes(mode)
 		? `
 import { spawn } from 'node:child_process';
-const bridge = spawn(${JSON.stringify(fileURLToPath(new URL("../extensions/.python/bin/python", import.meta.url)))}, ['-I', '-c', ${JSON.stringify(mode === "launch" ? stalledLaunch : stalledCleanup)}], {
+const bridge = spawn(${JSON.stringify(fileURLToPath(new URL("../core/.python/bin/python", import.meta.url)))}, ['-I', '-c', ${JSON.stringify(mode === "launch" ? stalledLaunch : stalledCleanup)}], {
     detached: true, cwd: ${JSON.stringify(hostRoot)},
     env: { ...process.env, PI_IPYTHON_OWNER_PID: String(process.pid) },
     stdio: ['pipe', 'ignore', 'inherit'],

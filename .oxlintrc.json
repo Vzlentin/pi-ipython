@@ -38,7 +38,7 @@
 	},
 	"overrides": [
 		{
-			"files": ["extensions/kernel-runtime.ts", "extensions/persistence.ts"],
+			"files": ["core/kernel-runtime.ts", "core/persistence.ts"],
 			"rules": { "anti-slop/no-runtime-typeof": ["error", { "allowInTypeGuards": true }] }
 		}
 	]

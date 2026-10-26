@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { DESCRIPTION } from "../extensions/cell.ts";
+import { DESCRIPTION } from "../core/cell.ts";
 import { createKernel, runKernel } from "./helpers.mjs";
 
 const root = realpathSync(mkdtempSync(join(tmpdir(), "pi-ipython-headstart-")));

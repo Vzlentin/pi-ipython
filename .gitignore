@@ -1,6 +1,5 @@
 node_modules/
-extensions/.python/
-extensions/.python.lock
+core/.python/
 **/__pycache__/
 *.py[cod]
 .coverage

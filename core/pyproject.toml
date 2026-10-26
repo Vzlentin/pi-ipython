@@ -1,0 +1,11 @@
+# The Python environment of the kernel and the bridge. uv installs it in .python from uv.lock.
+[project]
+name = "pi-ipython-core"
+version = "0"
+requires-python = "==3.12.*"
+dependencies = [
+    "ipykernel>=7,<8",
+    "jupyter-client>=8,<9",
+    "cloudpickle>=3,<4",
+    "pandas[excel]>=3,<4",
+]

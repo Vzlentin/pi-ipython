@@ -1,14 +1,17 @@
 import { appendFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
 import { stripVTControlCharacters } from "node:util";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { Value } from "typebox/value";
-import { shellQuote } from "./kernel-runtime.ts";
+import { JUPYTER_DATA_DIR } from "../core/python.ts";
 
 const MAX_TRANSCRIPT_BYTES = 16 * 1024 * 1024;
+
+function shellQuote(value: string): string {
+	return `'${value.replaceAll("'", `'"'"'`)}'`;
+}
 
 // The parts of Herdr's JSON results that the viewer uses.
 const HerdrId = Type.String({ minLength: 1 });
@@ -170,7 +173,7 @@ export class CellsView {
 		const command = `/bin/cat ${shellQuote(file)}; exec ${[
 			// Euporie needs a discoverable kernelspec even when attaching to an existing kernel.
 			"env",
-			`JUPYTER_PATH=${fileURLToPath(new URL("./.python/share/jupyter", import.meta.url))}`,
+			`JUPYTER_PATH=${JUPYTER_DATA_DIR}`,
 			"uv",
 			"tool",
 			"run",

@@ -1,11 +1,11 @@
 import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
 import { type Static, Type } from "typebox";
 import { Value } from "typebox/value";
-import { cellResult, DESCRIPTION, RESET_NOTICE } from "./cell.ts";
+import { cellResult, DESCRIPTION, RESET_NOTICE } from "../core/cell.ts";
+import { describeError, KernelLostError, type KernelRuntime } from "../core/kernel-runtime.ts";
+import { partialText } from "../core/output.ts";
+import { createRuntime, type Runtime } from "../core/persistence.ts";
 import { CellsView } from "./cells.ts";
-import { describeError, KernelLostError, type KernelRuntime } from "./kernel-runtime.ts";
-import { partialText } from "./output.ts";
-import { createRuntime, type Runtime } from "./persistence.ts";
 
 const CODEMODE_NOTE =
 	'In codemode scripts, a Python exception resolves with `status: "error"`; the call rejects when the kernel is lost. Pass data into a cell as a JSON string, for example `json.loads(${JSON.stringify(JSON.stringify(data))})`.';

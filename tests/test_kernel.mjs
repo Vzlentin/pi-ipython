@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { OUTPUT_CAPTURE_LIMIT_BYTES } from "../extensions/kernel-runtime.ts";
+import { OUTPUT_CAPTURE_LIMIT_BYTES } from "../core/kernel-runtime.ts";
 import { createKernel, runKernel } from "./helpers.mjs";
 
 const alive = (pgid) => {
