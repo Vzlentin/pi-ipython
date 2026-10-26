@@ -119,8 +119,9 @@ async function cell(conversation, code, tool = "ipython") {
 	assert.ok(entry, `turn ${turns} has no tool result`);
 	const message = entry.model[0];
 	const text = message.content.flatMap((part) => (part.type === "text" ? [part.text] : [])).join("\n");
+	const images = message.content.filter((part) => part.type === "image");
 
-	return { text, isError: message.isError === true, entryId: entry.id };
+	return { text, images, content: message.content, isError: message.isError === true, entryId: entry.id };
 }
 
 try {
@@ -210,6 +211,14 @@ try {
 
 		const main = await cell(host.conversation, "print(x)");
 		assert.match(main.text, /^8$/m, "the parent keeps its own state");
+
+		const figure = await cell(host.conversation, "import matplotlib.pyplot as plt; plt.plot([1, 2])");
+		assert.equal(figure.isError, false, figure.text);
+		assert.deepEqual(
+			figure.content.map((part) => part.type),
+			["text", "image"],
+		);
+		assert.equal(figure.images[0].mimeType, "image/png", "a figure reaches the model as a PNG after the text");
 
 		const long = await cell(host.conversation, "for i in range(3000): print(f'line {i}')");
 		assert.equal(long.isError, false, long.text);

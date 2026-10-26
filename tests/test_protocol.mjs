@@ -17,9 +17,11 @@ lines.on("line", (line) => {
 	const request = JSON.parse(line);
 	if (request.type === "startup") {
 		send({ type: "kernel_started", kernel_pgid: process.pid });
-		send({ type: "ready", protocol: broken === "ready" ? "2" : 2, kernel_pgid: process.pid, connection_file: "/fake.json" });
+		send({ type: "ready", protocol: broken === "ready" ? "3" : 3, kernel_pgid: process.pid, connection_file: "/fake.json" });
 	} else if (request.type === "execute") {
 		send({ type: "output", request_id: request.request_id, kind: "stdout", text: "fake\\n", continuation: false, final: true });
+		send({ type: "image", request_id: request.request_id, data: "A".repeat(9 * 1024 * 1024) });
+		for (let index = 0; index < 5; index += 1) send({ type: "image", request_id: request.request_id, data: "iVBORw0KGgo" + index });
 		send({ type: "result", request_id: request.request_id, status: "ok", execution_count: broken === "result" ? "1" : 1 });
 	} else if (request.type === "shutdown") {
 		process.exit(0);
@@ -80,6 +82,9 @@ try {
 	assert.equal(recovered.result.status, "ok");
 	assert.equal(recovered.result.executionCount, 1);
 	assert.equal(recovered.result.output, "fake\n");
+	// The image over the byte limit and the image past the count limit are dropped and counted, and the cell succeeds.
+	assert.deepEqual(recovered.result.images, ["iVBORw0KGgo0", "iVBORw0KGgo1", "iVBORw0KGgo2", "iVBORw0KGgo3"]);
+	assert.equal(recovered.result.imagesDropped, 2);
 	assert.equal((await runKernel(kernel, "1", cwd)).kernelReset, false);
 	assert.equal(bridges().length, 3);
 } finally {
@@ -90,4 +95,6 @@ assert.ok(bridges().every(exited));
 
 rmSync(directory, { recursive: true, force: true });
 
-console.log("protocol: invalid ready and result messages fail at once and the next start recovers");
+console.log(
+	"protocol: invalid ready and result messages fail at once, the next start recovers, and images are bounded",
+);

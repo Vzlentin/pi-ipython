@@ -5,7 +5,8 @@ Protocol (JSON lines). The first stdin line is {"type": "startup", "code": [...]
 each snippet runs hidden after the kernel is ready, then "ready" is sent.
 Later lines are {"type": "execute", "request_id", "code", "cwd"},
 {"type": "evaluate", "request_id", "expression"}, or {"type": "shutdown"}.
-Output streams as "output"/"clear" messages; requests end with "result".
+Output streams as "output"/"clear"/"image" messages; "image" carries one base64
+PNG in "data". Requests end with "result".
 """
 
 from __future__ import annotations
@@ -26,7 +27,7 @@ from typing import Any
 
 from jupyter_client import KernelManager
 
-BRIDGE_PROTOCOL_VERSION = 2
+BRIDGE_PROTOCOL_VERSION = 3
 _OUTPUT_MESSAGE_CHARS = 16_384
 _SEND_LOCK = threading.Lock()
 _OWNER_LOCK = threading.Lock()
@@ -95,6 +96,14 @@ def parent_id(message: dict[str, Any]) -> str | None:
     return value if isinstance(value, str) else None
 
 
+def _mime(data: dict[str, Any], key: str) -> str | None:
+    """One MIME value of a display message. Jupyter can split a value into a list of lines."""
+    value = data.get(key)
+    if isinstance(value, list):
+        value = "".join(str(part) for part in value)
+    return value if isinstance(value, str) else None
+
+
 class IPythonOutputStream:
     """Normalize incremental Jupyter output messages and clear semantics."""
 
@@ -118,10 +127,12 @@ class IPythonOutputStream:
                 "text": str(content.get("text", "")),
             }
         elif msg_type in ("execute_result", "display_data", "update_display_data"):
-            value = content.get("data", {}).get("text/plain")
-            if isinstance(value, list):
-                value = "".join(str(part) for part in value)
-            if isinstance(value, str):
+            data = content.get("data", {})
+            png = _mime(data, "image/png")
+            value = _mime(data, "text/plain")
+            if png is not None:
+                event = {"type": "image", "data": png}
+            elif value is not None:
                 event = {
                     "type": "text",
                     "kind": "result" if msg_type == "execute_result" else "display",
@@ -140,7 +151,7 @@ class IPythonOutputStream:
         if event is not None:
             if self._pending_clear:
                 self._clear()
-            if event["text"]:
+            if event["type"] == "image" or event["text"]:
                 self.callback(event)
 
     def _clear(self) -> None:
@@ -234,6 +245,9 @@ def execute(client: Any, manager: KernelManager, request_id: str, code: str, cwd
         if event["type"] == "clear":
             send({"type": "clear", "request_id": request_id})
             return
+        if event["type"] == "image":
+            send({"type": "image", "request_id": request_id, "data": event["data"]})
+            return
         text = event["text"]
         for start in range(0, len(text), _OUTPUT_MESSAGE_CHARS):
             end = min(start + _OUTPUT_MESSAGE_CHARS, len(text))
@@ -300,7 +314,11 @@ def main() -> int:
             return 0
         manager.start_kernel(
             cwd=cwd,
-            env=dict(os.environ, NO_COLOR="1"),
+            env=dict(
+                os.environ,
+                NO_COLOR="1",
+                MPLBACKEND="module://matplotlib_inline.backend_inline",
+            ),
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             close_fds=True,

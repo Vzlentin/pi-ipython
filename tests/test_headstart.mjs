@@ -30,7 +30,7 @@ try {
 
 	// hs: dir(hs) lists exactly the verbs of the card in the tool description, and each one is callable.
 	const card = [...DESCRIPTION.matchAll(/^hs\.(\w+)\(/gm)].map((match) => match[1]).sort();
-	assert.equal(card.length, 5);
+	assert.equal(card.length, 9);
 	const verbs = await run("print(json.dumps([sorted(dir(hs)), all(callable(getattr(hs, name)) for name in dir(hs))]))");
 	assert.deepEqual(JSON.parse(verbs), [card, true]);
 
@@ -94,6 +94,7 @@ try {
 
 	// sauve: text and unsupported suffixes fail before any write, and point to Pi's write tool.
 	await fails(`sauve(${at("text.json")}, "hello")`);
+	await fails(`sauve(${at("text.parquet")}, "hello")`);
 
 	for (const name of ["notes.txt", "saved.toml"]) {
 		const error = await fails(`sauve(${at(name)}, {"a": 1})`);
@@ -101,8 +102,8 @@ try {
 		assert.equal(await run(`import os\nprint(os.path.exists(${at(name)}))`), "False");
 	}
 
-	// sauve: csv, jsonl and xlsx need a DataFrame or records, and fail before any write.
-	for (const name of ["mapping.csv", "mapping.jsonl", "mapping.xlsx"]) {
+	// sauve: csv, jsonl, xlsx and parquet need a DataFrame or records, and fail before any write.
+	for (const name of ["mapping.csv", "mapping.jsonl", "mapping.xlsx", "mapping.parquet"]) {
 		const error = await fails(`sauve(${at(name)}, {"a": [1]})`);
 		assert.equal(error.ename, "TypeError");
 		assert.equal(await run(`import os\nprint(os.path.exists(${at(name)}))`), "False");
@@ -158,6 +159,18 @@ try {
 	);
 
 	assert.deepEqual(JSON.parse(roundTrip), ["name,n", true, true]);
+
+	// sauve: parquet has no index column and keeps mixed types through charge.
+	const parquet = await run(
+		[
+			"import pyarrow.parquet",
+			`mixed = pd.DataFrame({"name": ["a", None, "c"], "n": [1, 2, 3], "x": [1.5, float("nan"), 3.0], "ok": [True, False, True], "when": pd.to_datetime(["2024-01-01", "2024-02-01", "2024-03-01"])})`,
+			`sauve(${at("out.parquet")}, mixed.iloc[::-1])`,
+			`print(json.dumps([pyarrow.parquet.read_schema(${at("out.parquet")}).names == list(mixed.columns), charge(${at("out.parquet")}).equals(mixed.iloc[::-1].reset_index(drop=True))]))`,
+		].join("\n"),
+	);
+
+	assert.deepEqual(JSON.parse(parquet), [true, true]);
 	// montre: returns the same object it receives.
 	const same = await run(`df = pd.DataFrame({"row": [f"row-{i}" for i in range(1000)]})\nprint(montre(df) is df)`);
 	assert.equal(same.split("\n").at(-1), "True");
@@ -224,9 +237,145 @@ try {
 	);
 
 	assert.deepEqual(JSON.parse(nullable), [[2], ["changed"]]);
+
+	// joins: prints matched, only a and only b rows, takes records, and adds no _merge column.
+	const joined = await run(
+		[
+			`ja = [{"id": 1, "x": "a"}, {"id": 2, "x": "b"}, {"id": 3, "x": "c"}, {"id": 4, "x": "d"}]`,
+			`jb = [{"id": 2, "y": 20}, {"id": 3, "y": 30}, {"id": 5, "y": 50}]`,
+			`found = hs.joins(ja, jb, "id")`,
+			`print(json.dumps([len(found), found.columns.tolist()]))`,
+		].join("\n"),
+	);
+
+	assert.match(joined, /^matched 2, only a 2, only b 1$/m);
+	assert.deepEqual(JSON.parse(joined.split("\n").at(-1)), [4, ["id", "x", "y"]]);
+
+	// joins: a key that repeats in b refuses a left or inner join with more rows than a, and names only the repeated key of a.
+	await run(
+		`left = pd.DataFrame({"id": [1, 2, 3]})\nright = pd.DataFrame({"id": [2, 2, 2, 2, 4], "y": [1, 2, 3, 4, 5]})`,
+	);
+
+	for (const how of ["", `, how="inner"`]) {
+		const refused = await fails(`hs.joins(left, right, "id"${how})`);
+		assert.equal(refused.ename, "ValueError");
+		assert.match(refused.evalue, /1 keys repeat in b, such as \[2\];/);
+	}
+
+	// joins: validate= returns the merge, and m:m turns the guard off.
+	const sizes = await run(
+		`print(len(hs.joins(left, right.drop_duplicates("id"), "id", validate="m:1")), len(hs.joins(left, right, "id", validate="m:m")))`,
+	);
+
+	assert.equal(sizes.split("\n").at(-1), "3 6");
+
+	// decris: one row per column; a mixed column has no min or max, an array column has no distinct, top, min or max, a category column with an unused category leaves it out of top, and records give the same profile.
+	const profile = await run(
+		[
+			"import numpy as np",
+			`frame = pd.DataFrame({"n": [1.0, None, 3.0, 3.0], "t": ["a", "b", None, "a"], "m": [1, "x", None, 2], "r": [np.array([1, 2]), np.array([3, 4]), None, np.array([1, 2])]})`,
+			`p = hs.decris(frame)`,
+			`q = p.astype(object).where(p.notna(), None)`,
+			`print(json.dumps([p["missing"].round(3).tolist(), q["distinct"].tolist(), q["top"].tolist(), q["min"].tolist(), q["max"].tolist(), bool(p.equals(hs.decris(frame.to_dict("records"))))]))`,
+			`c = hs.decris(pd.DataFrame({"c": pd.Categorical(["a", None, "a", "b"], categories=["a", "b", "z"])}))`,
+			`print(json.dumps([c["distinct"].tolist(), c["top"].tolist()]))`,
+		].join("\n"),
+	);
+
+	assert.deepEqual(JSON.parse(profile.split("\n").at(-2)), [
+		[0.25, 0.25, 0.25, 0.25],
+		[2, 2, 3, null],
+		[[3, 1], ["a", "b"], [1, "x", 2], null],
+		[1, "a", null, null],
+		[3, "b", null, null],
+		true,
+	]);
+	assert.deepEqual(JSON.parse(profile.split("\n").at(-1)), [[2], [["a", "b"]]]);
+
+	// verifie: all true checks print one line each and return None.
+	assert.equal(await run(`print(hs.verifie({"a": True, "b": 1 == 1}))`), "passed a\npassed b\nNone");
+
+	// verifie: every check runs before one error names all the failed checks.
+	const { result: checked } = await runKernel(kernel, `hs.verifie({"a": True, "b": False, "c": 1 > 2})`, root);
+	assert.equal(checked.status, "error");
+	assert.equal(checked.error.ename, "AssertionError");
+	assert.match(checked.error.evalue, /failed: b, c$/);
+	assert.match(checked.output, /^passed a$/m);
+	assert.match(checked.output, /^failed b$/m);
+	assert.match(checked.output, /^failed c$/m);
+
+	// verifie: a check that is not one True or False fails before any check runs.
+	const { result: series } = await runKernel(kernel, `hs.verifie({"a": True, "s": pd.Series([True, False])})`, root);
+	assert.equal(series.error.ename, "TypeError");
+	assert.match(series.error.evalue, /not Series for 's': use \.all\(\)$/);
+	assert.doesNotMatch(series.output, /passed a/);
+
+	// interroge: a fake BigQuery client records each query; this block stays last because the patch remains in the kernel.
+	await run(
+		[
+			"import os",
+			"from google.cloud import bigquery",
+			"class FakeJob:",
+			"    def __init__(self, client):",
+			"        self.client = client",
+			"        self.statement_type = client.kind",
+			"        self.total_bytes_processed = client.estimate",
+			"    def to_dataframe(self, **kwargs):",
+			"        if self.client.interrupt:",
+			"            raise KeyboardInterrupt",
+			"        return pd.DataFrame({'x': [1, 2]})",
+			"    def cancel(self):",
+			"        FakeClient.calls.append('cancel')",
+			"class FakeClient:",
+			"    calls = []",
+			"    kind = 'SCRIPT'",
+			"    estimate = 1_234_567_890",
+			"    interrupt = False",
+			"    def __init__(self, project):",
+			"        FakeClient.calls.append(('project', project))",
+			"    def query(self, sql, job_config):",
+			"        FakeClient.calls.append((job_config.dry_run, job_config.use_query_cache, job_config.maximum_bytes_billed))",
+			"        return FakeJob(self)",
+			"bigquery.Client = FakeClient",
+		].join("\n"),
+	);
+
+	// interroge: a missing environment fails before any client exists.
+	await run(`os.environ.pop("GOOGLE_APPLICATION_CREDENTIALS", None)\nos.environ.pop("CLOUDSDK_CORE_PROJECT", None)`);
+	assert.equal((await fails(`hs.interroge("select 1")`)).ename, "RuntimeError");
+	assert.equal(await run("print(FakeClient.calls)"), "[]");
+
+	// interroge: with no cap, it prints the type and the estimate, returns None and runs only the dry run.
+	await run(
+		`os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "/tmp/key.json"\nos.environ["CLOUDSDK_CORE_PROJECT"] = "demo-project"`,
+	);
+	assert.equal(await run(`result = hs.interroge("select 1")`), "SCRIPT, 1.2 GB");
+	assert.equal(
+		await run("print(result is None, FakeClient.calls)"),
+		"True [('project', 'demo-project'), (True, False, None)]",
+	);
+
+	// interroge: an estimate above the cap is refused with the type and the estimate, and nothing runs.
+	await run("FakeClient.calls.clear()\nFakeClient.estimate = 25_000_000_000");
+	const above = await fails(`hs.interroge("select 1", cap="20 GB")`);
+	assert.equal(above.ename, "ValueError");
+	assert.match(above.evalue, /SCRIPT, 25,000,000,000 bytes/);
+	assert.equal(await run("print(FakeClient.calls)"), "[('project', 'demo-project'), (True, False, None)]");
+
+	// interroge: within the cap, the dry run comes first, then the run billed at most the cap.
+	await run("FakeClient.calls.clear()\nFakeClient.estimate = 1_000");
+	assert.equal(
+		await run(`print(hs.interroge("select 1", cap="4.1 GB")["x"].tolist(), FakeClient.calls)`),
+		"[1, 2] [('project', 'demo-project'), (True, False, None), (None, None, 4100000000)]",
+	);
+
+	// interroge: an interrupt during the download cancels the job and raises again.
+	await run("FakeClient.calls.clear()\nFakeClient.interrupt = True");
+	assert.equal((await fails(`hs.interroge("select 1", cap=10_000)`)).ename, "KeyboardInterrupt");
+	assert.equal(await run("print(FakeClient.calls[-1])"), "cancel");
 } finally {
 	await kernel.shutdown();
 	rmSync(root, { recursive: true, force: true });
 }
 
-console.log("headstart: charge, sauve, montre, combien and compare passed");
+console.log("headstart: charge, sauve, montre, combien, compare, joins, decris, verifie and interroge passed");

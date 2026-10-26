@@ -44,6 +44,7 @@ try {
 
 	const two = await runKernel(plain, "print(value + 1, os.getcwd())", second);
 	assert.equal(two.result.output.trim(), `42 ${second}`);
+	assert.deepEqual(two.result.images, []);
 	const failed = await runKernel(plain, "raise ValueError('fixture')", second);
 	assert.equal(failed.result.status, "error");
 	assert.deepEqual(failed.result.error, { ename: "ValueError", evalue: "fixture" });
@@ -169,6 +170,67 @@ try {
 }
 
 assert.equal(existsSync(dirname(beforeCrash)), false);
+
+// A new kernel imports the data packages the runtime provisions.
+const data = createKernel();
+
+try {
+	const versions = await runKernel(
+		data,
+		"import importlib.metadata, pyarrow, google.cloud.bigquery as bq, db_dtypes, matplotlib\nprint(pyarrow.__version__, bq.__version__, importlib.metadata.version('db-dtypes'), matplotlib.__version__)",
+		first,
+	);
+
+	assert.equal(versions.result.status, "ok", versions.result.output);
+	assert.equal(versions.result.output.trim().split(/\s+/).length, 4);
+} finally {
+	await data.shutdown();
+}
+
+// Figures reach the runtime as PNGs in display order, even when the listener sets another matplotlib backend.
+const figures = createKernel((event) => {
+	event.env.MPLBACKEND = "agg";
+});
+
+const pngWidth = (image) => Buffer.from(image, "base64").readUInt32BE(16);
+
+try {
+	const fresh = await runKernel(
+		figures,
+		"import sys; print('matplotlib' in sys.modules, 'google.cloud.bigquery' in sys.modules)",
+		first,
+	);
+
+	assert.equal(fresh.result.output.trim(), "False False");
+
+	const one = await runKernel(figures, "import matplotlib.pyplot as plt; plt.plot([1, 2])", first);
+	assert.equal(one.result.status, "ok", one.result.output);
+	assert.equal(one.result.images.length, 1);
+	assert.deepEqual(
+		[...Buffer.from(one.result.images[0], "base64").subarray(0, 8)],
+		[0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a],
+	);
+	assert.doesNotMatch(one.result.output, /<Figure/);
+
+	const six = await runKernel(figures, "for i in range(6): plt.figure(figsize=(2 + i, 2)); plt.plot([0, i])", first);
+	assert.equal(six.result.images.length, 4);
+	assert.equal(six.result.imagesDropped, 2);
+
+	const widths = six.result.images.map(pngWidth);
+
+	for (let index = 1; index < widths.length; index += 1) assert.ok(widths[index] > widths[index - 1], `${widths}`);
+
+	const cleared = await runKernel(
+		figures,
+		"plt.plot([1]); plt.show(); from IPython.display import clear_output; clear_output(); print('after')",
+		first,
+	);
+
+	assert.deepEqual(cleared.result.images, []);
+	assert.equal(cleared.result.output, "after\n");
+} finally {
+	await figures.shutdown();
+}
 
 // A failing startup snippet fails the kernel start instead of running cells without it.
 const broken = createKernel((event) => event.startupCode.push("raise RuntimeError('startup fixture')"));

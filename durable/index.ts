@@ -128,14 +128,14 @@ export default function ipython({ durable, ai, events }: DurableHost) {
 				}
 
 				// Resets, restores and the truncation line are remarks for the model, which the harness renders after the output.
-				const { data, header } = cellResult(execution, notices, (text) => kernel.saveOutput(text));
+				const { data, header, figures } = cellResult(execution, notices, (text) => kernel.saveOutput(text));
 				const diagnostics: Durable.ToolDiagnostic[] = data.notices.map((message) => ({ severity: "info", message }));
 
 				if (header) diagnostics.push({ severity: "info", code: "output_truncated", message: header });
 				const text = data.output || (data.status === "error" && describeError(execution.result.error)) || "[no output]";
 
 				return {
-					output: [{ type: "text", text }],
+					output: [{ type: "text", text }, ...figures],
 					structuredOutput: data,
 					details: { status: data.status, kernelReset: execution.kernelReset, truncated: data.truncated },
 					diagnostics,

@@ -196,7 +196,8 @@ export default function ipythonExtension(pi: ExtensionAPI) {
 			}
 
 			const { result, kernelReset } = execution;
-			const { data, header } = cellResult(execution, [...undelivered, ...notices], (text) => kernel.saveOutput(text));
+			const received = [...undelivered, ...notices];
+			const { data, header, figures } = cellResult(execution, received, (text) => kernel.saveOutput(text));
 			const notice = data.notices.join("\n\n");
 			undelivered = [];
 			transcript?.output(result.output);
@@ -225,7 +226,12 @@ export default function ipythonExtension(pi: ExtensionAPI) {
 
 			const structuredContent: Static<typeof outputSchema> = data;
 
-			return { content: [{ type: "text", text }], details, structuredContent, isError: data.status === "error" };
+			return {
+				content: [{ type: "text", text }, ...figures],
+				details,
+				structuredContent,
+				isError: data.status === "error",
+			};
 		},
 	});
 
