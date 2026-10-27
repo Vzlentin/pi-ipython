@@ -1,179 +1,205 @@
 # pi-ipython
 
-A Pi package providing one `ipython` tool (a single `code` parameter) backed by a
-persistent, extension-owned Jupyter/IPython kernel, with top-level `await` and
-native IPython magics. It has no RLM support of its own;
-[pi-rlm](https://github.com/Vzlentin/pi-rlm) adds it on top. The same tool also
-runs in hosts built on pi-durable, see [pi-durable](#pi-durable).
+A persistent Python workspace for [Pi](https://github.com/earendil-works/pi).
+
+The package adds one tool, `ipython`, that runs code in a Jupyter kernel. The kernel stays alive between calls, so the agent loads data once and keeps working on it. Variables, imports and functions are still there in the next cell.
+
+```python
+# cell 1
+orders = hs.charge("orders.xlsx", sheet="2026")
+hs.decris(orders)
+```
+
+```python
+# cell 2, later in the conversation
+monthly = orders.groupby("month")["amount"].sum()
+monthly.plot()  # the model sees the chart
+```
+
+What you get:
+
+- State that follows the conversation. Each cell is checkpointed, so `/tree`, `/fork`, resume, `/reload` and a crash bring back the variables of the current branch.
+- Top-level `await` and IPython magics.
+- Figures sent back to the model as images.
+- `hs`, a small pandas toolkit to load, save, inspect and check data, ready in every kernel.
+- `/cells` in Herdr: a live IPython console on the same kernel.
+- A Python 3.12 environment of its own, separate from your project.
+
+[pi-rlm](https://github.com/Vzlentin/pi-rlm) adds recursive model calls on top of this tool. Hosts built on pi-durable get the same tool, see [pi-durable hosts](#pi-durable-hosts).
 
 ## Install
 
-Requirements:
+You need:
 
-- macOS or Linux.
-- Node.js 22.19 or newer, npm, Git, and Pi (tested with 1.2.0).
-- `uv` 0.7.12 or newer on `PATH`. Each session checks the extension-owned
-  Python 3.12 environment in `core/.python` with uv before its first kernel
-  starts. The first tool call provisions the environment, so it needs network
-  access. uv installs the packages of `core/pyproject.toml` at the versions of
-  `core/uv.lock`. Other packages that you install in the environment stay.
+- macOS or Linux
+- Pi (tested with 1.4.0), Node.js 22.19 or later, and Git
+- [uv](https://docs.astral.sh/uv/) 0.7.12 or later on your `PATH`
 
 ```bash
 pi install https://github.com/Vzlentin/pi-ipython
 ```
 
-For development, from a clone: `npm install`, `npm test`, then run
-`pi -ne -e ./extensions/ipython.ts` for an isolated session.
+The first `ipython` call creates the kernel's Python environment with uv, so it needs network access. After that, each session only checks the environment, offline.
 
-The kernel always uses matplotlib's inline backend, even when `MPLBACKEND` is
-set. The figures that a cell shows reach the runtime as base64 PNGs in
-`BridgeResult.images`, up to 4 figures and 8 MiB for each cell. `BridgeResult.imagesDropped` counts the other
-figures. The tool result gives the figures to the model as PNG image content after the text. When the cell
-dropped figures, a text part after the images tells the model how many it did not get.
+The environment is in `core/.python` inside the package. uv installs the packages of `core/pyproject.toml` at the versions in `core/uv.lock`. Packages that you add yourself stay.
 
-## Extending the kernel
+## The `ipython` tool
 
-Before every kernel start (including restarts), the extension emits
-`ipython:kernel-starting` on `pi.events` with a mutable payload. In a pi-durable
-host it goes to the event bus the host passes in:
+The tool takes one parameter, `code`: a Python or IPython cell. Each cell runs in the working directory of the session.
 
-```ts
-interface KernelStartingEvent {
-	env: Record<string, string>; // merged into the bridge and kernel environment
-	startupCode: string[]; // run hidden once the kernel is ready
-	waitFor(promise: Promise<unknown>): void; // awaited before the kernel is spawned
-}
-```
+| When a cell | The tool |
+| --- | --- |
+| prints more than 2000 lines or 50 KiB | gives the model the tail, and saves the full output to a temporary file whose path is in the result |
+| prints more than 1 MiB | interrupts the cell |
+| shows more than 4 figures or 8 MiB of figures | drops the others, and tells the model how many |
 
-Listeners must register on the payload before their first `await`. Environment
-values can be filled in by a promise passed to `waitFor`. A failing startup
-snippet fails the kernel start. The variables reach the kernel, not Pi's own
-process.
+Matplotlib always uses the inline backend, even when `MPLBACKEND` is set.
 
-In pi-durable hosts only, the event also has `conversationId`, the conversation that owns the kernel. Each cell
-also emits two events on the host's bus:
+When you cancel a cell, the kernel gets SIGINT. If the cell stops within 3 seconds, the result gives its partial output and the kernel keeps its state. If not, the kernel and its child processes are killed, and the next cell starts on a new kernel with the last checkpoint.
 
-- `ipython:cell-start` with `{ conversationId, api, context }`, before the cell runs. `api` and `context` are the
-  `ipython` call's, so a listener can use `api.commit(..., context)` while the cell runs, for example to create a
-  conversation owned by `api.taskId`.
-- `ipython:cell-end` with `{ conversationId }`, after the cell ends, also when it raises, is cancelled or loses its
-  kernel.
+The kernel stops within 5 seconds after Pi exits, also when Pi is killed. On a normal exit, pending checkpoints get up to 10 seconds to finish. A hard exit can lose the last one.
 
-## Load and save files
+## `hs`, the data toolkit
 
-Every kernel starts with `headstart` imported as `hs`, which has nine functions. `hs` is a startup name, so checkpoints do not save it. Do not use `hs` as a variable: a rebound `hs` is not saved and is not cleared on restore.
+Every kernel starts with `headstart` imported as `hs`. The tool description gives the agent the same list, and tells it to use Pi's `write`, `edit` and `bash` tools for files and commands, not Python.
 
-The `ipython` tool description carries the `hs` card, and tells agents to use the `write` and `edit` tools for files and `bash` for commands, tests and searches.
+| Function | What it does |
+| --- | --- |
+| `hs.charge(path, sheet=None)` | Loads csv, json, jsonl, toml, parquet, xlsx, xlsm, xls, xlsb or ods. Codes with leading zeros, such as `00042`, stay text. It skips bad jsonl lines and says how many, and lists the other sheets of a workbook. |
+| `hs.sauve(path, data)` | Saves a DataFrame or records to csv, json, jsonl, parquet or xlsx, without the index. json also takes a plain value. A dict of frames gives one xlsx sheet per key, with a frozen header, a filter and fitted column widths. It refuses text: use Pi's `write` tool. |
+| `hs.montre(x, n=40)` | Prints a short view of any value, head and tail, and returns it. As the last line of a cell, it shows the view once. |
+| `hs.combien(df, key, *keys, n=20)` | Counts the `n` most common groups of the keys, with the count `n` and the `share` of all rows. Missing values count as a group. |
+| `hs.compare(a, b, key)` | Lists the rows that differ between two frames, with `state` set to `only a`, `only b` or `changed`. |
+| `hs.joins(a, b, key, how="left", validate=None)` | Merges two frames and prints the matched, only a and only b row counts. A left or inner join that would give more rows than `a` raises, unless you pass `validate=` as in pandas `merge`. |
+| `hs.decris(df)` | Gives one row per column: type, share of missing values, distinct count, top 3 values, min and max. |
+| `hs.verifie({"name": cond})` | Runs every check and prints each result. If any fail, it then raises one `AssertionError` that names them all. Each condition must be one bool, such as `(df.x > 0).all()`. |
+| `hs.interroge(sql, cap=None)` | Runs a BigQuery query, always after a dry run. Without `cap`, it prints the statement type and the estimated bytes, and runs nothing. With `cap`, as bytes or text such as `"20 GB"`, it runs the query billed at most `cap`. |
 
-```python
-df = hs.charge("data.xlsx", sheet="B")  # also .csv, .json, .jsonl, .toml, .parquet, .xlsm, .xls, .xlsb, .ods, or a list of records
-hs.sauve("out.xlsx", {"First": df, "Second": other})  # also .json, .jsonl, .csv, .parquet
-```
+Every function that takes a frame also takes records, a list of dicts.
 
-- `charge` keeps codes with leading zeros, such as `00042`, as text in csv and spreadsheet files. It prints the
-  number of bad lines it skips in a jsonl file, and the names of the other sheets in a workbook. Only a workbook
-  takes `sheet`.
-- `sauve` writes a DataFrame, a list of records, or a plain value for `.json`. An xlsx file gets one sheet per key
-  of a dict, a frozen header row, a filter, and column widths that fit the content. `.jsonl`, `.csv`, `.xlsx` and
-  `.parquet` need a DataFrame or records. It does not write text or other formats: use Pi's `write` tool for those.
-- `montre(x, n=40)` prints a short view of `x` and returns `x`. A frame or series with more than `n` rows shows its
-  first and last rows and the number of hidden rows. Long text or a long `repr` keeps its head and tail. As the last
-  line of a cell, the view is shown once, not twice.
-- `combien(df, key, *keys, n=20)` counts rows by one or more keys, with missing values counted as a value. It gives
-  the `n` most common groups, with the count `n` and its `share`, a fraction from 0 to 1.
-- `compare(a, b, key)` lists the rows that differ between two frames on a key or a list of keys, with `state`
-  `only a`, `only b` or `changed`. Missing values on both sides count as equal. A duplicate key raises an error.
-- `interroge(sql, cap=None)` runs a BigQuery query. It needs `GOOGLE_APPLICATION_CREDENTIALS` and
-  `CLOUDSDK_CORE_PROJECT` in the environment, so start Pi in a folder whose environment sets them. It always does a
-  dry run first. With no cap, it prints the statement type and the estimated bytes, and runs nothing. With a cap, it
-  refuses an estimate above the cap, and else runs the query billed at most the cap and returns a DataFrame. A cap
-  is an int of bytes, or text such as `"20 GB"` in decimal units (B, KB, MB, GB, TB).
-- `joins(a, b, key, how="left", validate=None)` merges two frames on a key or a list of keys and returns the result.
-  It prints the rows of `a` whose key is in `b` (matched), the rows of `a` whose key is not in `b` (only a), and the
-  rows of `b` whose key is not in `a` (only b). Before it merges, a left or inner join raises an error when a key of
-  `a` repeats in `b`, because the join would give more rows than `a`. The error names up to 10 of these keys. Pass
-  `validate=`, as in pandas `merge`, to allow it. Right and outer joins are not checked.
-- `decris(df)` returns one row for each column of `df`: the type, the share of missing values, the count of distinct
-  values, the 3 most common values, and the min and max. Missing values do not count in distinct or top values. The
-  min and max are empty when the column mixes types that do not compare, such as numbers and text. The distinct
-  and top values are empty when the cells are lists, dicts or arrays.
-- `verifie(checks)` runs every check of a dict of names and conditions. It prints `passed <name>` or
-  `failed <name>` for each one, and returns `None` when all pass. Else, after all checks ran, it raises one
-  `AssertionError` that names every failed check. Each condition must be one `True` or `False`, such as
-  `(df.x > 0).all()`. Any other value, such as a Series, raises a `TypeError` before any check runs.
+`hs.interroge` needs `GOOGLE_APPLICATION_CREDENTIALS` and `CLOUDSDK_CORE_PROJECT`. Start Pi in a folder whose environment sets them.
 
-## Cells in Herdr
+Checkpoints skip `hs`, so do not use `hs` as a variable name. A value that you bind to `hs` is not saved, and a restore does not clear it.
 
-In interactive Pi inside Herdr, use `/cells` or `Ctrl+Shift+I` to toggle an IPython console on the right, attached to the same kernel. It first prints the recorded history (code, output, progress, errors, and reset notices), then mirrors each new cell live as Pi runs it. Type at its prompt to inspect the kernel, for example `%whos`, `%history -o`, or a variable name. Cells run while the console is closed remain in the history. Your focus stays in Pi. Repeat `/cells` to close it.
+## `/cells`: a console on the kernel
 
-The console is [Euporie Console](https://euporie.readthedocs.io/) 2.10.4, started through `uv tool run` in a separate cached environment. It provides syntax highlighting and rich live output. Previous cells are printed as plain text above Euporie, available through terminal scrollback, not loaded as notebook cells or rerun. Mouse capture is disabled so you can scroll back normally. Use `Ctrl+Enter` to run code at the prompt.
+In interactive Pi inside Herdr, `/cells` or `Ctrl+Shift+I` opens an IPython console on the right, attached to the same kernel. Run it again to close it. Your focus stays in Pi.
 
-It does not install anything into the extension-owned Python runtime. Opening `/cells` starts the kernel if needed. After a kernel reset, repeat `/cells` to reconnect. Closing the console does not stop the kernel.
+The console first prints the cells run so far: code, output, progress, errors and reset notices. Then it shows each new cell live. You can type at its prompt, for example `%whos`, `%history -o` or a variable name. `Ctrl+Enter` runs the code.
 
-History is plain text, recorded from the first tool call after loading the extension. Its private temporary file is limited to 16 MiB. `/reload`, session changes, and exit close the console and delete its temporary files. The model's output limits are unchanged.
+Code that you run in the console changes the kernel that Pi uses. Do not run code there while Pi is working.
 
-**The console is interactive, not read-only.** Code entered there changes the same kernel state as Pi. Do not run code there while Pi is working.
+Good to know:
 
-## Interruption
+- The console is [Euporie Console](https://euporie.readthedocs.io/) 2.10.4. It runs with `uv tool run` in its own cached environment, and adds nothing to the kernel's environment.
+- Earlier cells are plain text in the terminal scrollback. They are not notebook cells and do not run again. Mouse capture is off, so you can scroll normally.
+- History starts at the first tool call after the extension loads, and stops at 16 MiB.
+- Opening the console starts the kernel if needed. Closing it does not stop the kernel. After a kernel reset, run `/cells` again to reconnect.
+- `/reload`, a session change and exit close the console and delete its temporary files.
 
-Cancellation and output overflow first send SIGINT to the kernel process group. If the cell stops within 3 seconds, its partial output is returned as an error and kernel state is preserved. Otherwise the kernel and associated child work are killed. Top-level `await` is supported, including a signal-wakeup workaround for ipykernel 7.
+## Checkpoints
 
-On macOS and Linux, the bridge and kernel exit within five seconds after their owning Pi process exits, including SIGKILL during a cell or checkpoint save. Normal shutdown allows up to ten seconds to flush pending checkpoints before stopping the kernel. An abrupt exit can lose an unfinished checkpoint.
+After each cell, the extension saves the variables of the kernel in the background. Before the next cell, it restores the latest checkpoint of the current conversation branch, if the kernel does not already have it. The result after a restore names the cell it came from, the names it restored and the values it skipped.
 
-## Codemode scripts
+Cells that other tools run, such as `codemode` scripts, are checkpointed too. Their checkpoint goes into an `ipython-checkpoint` entry of the session, because Pi does not save their results.
 
-In a `codemode` script, `tools.ipython` resolves to an object with `status`, `output`, `executionCount`, `error` (`ename` and `evalue`), `truncated`, `fullOutputPath`, and `notices`. A Python exception or an interrupted cell resolves with `status: "error"`, so the script can check it and keep going on the same kernel. The call rejects when the kernel is lost.
+What a checkpoint keeps:
 
-`notices` holds kernel restarts and checkpoint restores that happened before the cell ran. They are also appended to the script's own result, so the model sees them even when the script does not return them.
+- Public variables, saved with cloudpickle.
+- Functions and classes defined in cells, saved by value. A restored function uses the globals of the current kernel.
+- Imported modules, imported again.
 
-Cells get their code as a string. To pass script data in, embed it as a JSON string, for example `json.loads(${JSON.stringify(JSON.stringify(data))})`.
+What it does not keep:
 
-## Persistence
+- Names that start with `_`, IPython internals, `hs` and other names that extensions add at startup.
+- Live objects: open files, sockets, generators, coroutines and tasks.
+- A value bigger than 64 MiB, or a cell with more than 256 MiB of saved data.
+- Anything outside the namespace: files on disk, `sys.path`, `os.environ`, the working directory, monkeypatches, module globals and threads.
 
-By default, each completed Pi `ipython` cell receives a checkpoint ID and its public, supported variables are saved in the background. Before the next cell, the extension waits for that save and finds the nearest IPython checkpoint on the current conversation branch. Navigating with `/tree`, resuming, forking, reloading, or recovering from a crash therefore restores that branch's latest committed cell. If its newest checkpoint is unavailable, the next older committed checkpoint is used; a branch with no IPython cells resets the namespace to its startup state.
+Each name is saved on its own, so two names for one object come back as two objects. Code that you run in `/cells` joins the checkpoint of the next Pi cell.
 
-Cells that another tool runs, such as a `codemode` script, are checkpointed too. Pi does not save their results, so each checkpoint ID goes into an `ipython-checkpoint` custom entry on the branch. If the script fails later, its earlier cells stay checkpointed because the kernel state already changed.
+When something goes wrong:
 
-The result after a restore reports its source cell, restored names, and skipped values. A failed background save does not roll back the live kernel. A failed save is reported with the next result. A cancelled restore is retried on the next call; a restore that fails or times out is not, and the cell runs on the namespace left behind. If restoring a value kills the kernel, that value is deleted from the store and the restore is retried on a fresh kernel, up to three attempts per call.
+- A failed save does not change the live kernel. The next result reports it.
+- When the newest checkpoint of a branch is gone, the next older one is used. A branch with no cells goes back to the startup state of the kernel.
+- A cancelled restore runs again with the next cell. A restore that fails or times out does not, and the cell runs on what the restore left.
+- When a value kills the kernel during a restore, that value is deleted from the store, and the restore runs again on a new kernel, up to 3 times.
 
-Checkpointing is best-effort:
+Checkpoints are in `${XDG_CACHE_HOME:-~/.cache}/pi-ipython/checkpoints/`, and each value is stored once. Checkpoints unused for 30 days are deleted. Above 2 GiB, the least recently used ones are deleted first. One lock covers every session, so a slow `__setstate__` during a restore can block other sessions for up to 13 seconds.
 
-- Module aliases are re-imported. Cell-defined functions and classes are saved by value with cloudpickle, and restored functions use the current kernel globals.
-- Names beginning with `_`, IPython internals, startup names such as `hs` and those supplied by extensions, and live files, sockets, generators, coroutines, and tasks are not saved.
-- Values are limited to **64 MiB each** and **256 MiB of pickled data per cell**. Separate names are serialized independently, so aliases can restore as separate objects even though unchanged serialized content is deduplicated on disk.
-- Files written by cells are not rewound. Neither are live resources or process state such as `sys.path`, `os.environ`, the working directory, monkeypatches, imported module globals, or threads.
-- Input entered directly in `/cells` is included in the next Pi cell's checkpoint. If you navigate before another Pi cell, that console-only input is not followed to the other branch.
-
-Content-addressed blobs and per-cell manifests live in `${XDG_CACHE_HOME:-~/.cache}/pi-ipython/checkpoints/`. A global lock serializes saves, restores, and cleanup across sessions; a restored value's `__setstate__` runs under it, so a slow one blocks other sessions for up to the 10-second restore deadline plus the 3-second interrupt grace. Manifests unused for 30 days are removed, and least-recently-used manifests are evicted when the store exceeds 2 GiB; unreferenced blobs are then deleted. Manifest access during restore refreshes its recency.
-
-Disable all checkpoint saves, restores, and checkpoint result details with either:
+To turn checkpoints off, set an environment variable:
 
 ```bash
 export PI_IPYTHON_PERSISTENCE=0
 ```
 
-or `.pi/pi-ipython.json` in the working directory or an ancestor up to the Git root:
+Or add `.pi/pi-ipython.json` to the working directory, or to a parent folder up to the Git root:
 
 ```json
 { "persistence": false }
 ```
 
-Opt-out leaves existing cache data untouched and otherwise restores the extension's non-persistent behavior.
+This turns off all checkpoint saves and restores. It does not delete the cache.
 
-**Checkpoint security:** pickles can execute code and may contain sensitive data. Store directories are `0700`, files are `0600`, and symlinks, unowned paths, non-private paths, and malformed checkpoint IDs are refused. Do not place untrusted files in the checkpoint cache or share it with another user.
+Pickles can run code when they load, and can hold sensitive data. The store folders are `0700` and the files `0600`. The store refuses symlinks, paths that you do not own or that are not private, and malformed checkpoint IDs. Do not put files from others in the cache, and do not share it with another user.
 
-## pi-durable
+## Security
 
-Hosts that run agents on [pi-durable](https://www.npmjs.com/package/@earendil-works/pi-durable), such as
-[workflows](https://github.com/Vzlentin/workflows), get the same `ipython` tool from `durable/index.ts`. The
-package declares it in its own field, which Pi does not read:
+The kernel is not sandboxed. Code runs with your user permissions and can read your files, your environment variables and the network. The separate Python environment isolates packages, not access.
+
+## Build on it
+
+### Codemode scripts
+
+In a `codemode` script, `await tools.ipython({ code })` gives an object:
+
+```ts
+{
+	status: "ok" | "error"; // "error" when the cell raised or was interrupted
+	output: string; // the output tail, without ANSI codes
+	executionCount?: number;
+	error?: { ename: string; evalue: string };
+	truncated: boolean;
+	fullOutputPath?: string;
+	notices: string[]; // kernel resets and checkpoint restores before the cell ran
+}
+```
+
+A Python exception or an interrupt gives `status: "error"`, so the script can check it and go on with the same kernel. The call rejects only when the kernel is lost. The `notices` are also added to the result of the script, so the model sees them even when the script does not return them.
+
+A cell gets its code as a string. To pass data in, embed it as a JSON string:
+
+```js
+await tools.ipython({ code: `import json\ndata = json.loads(${JSON.stringify(JSON.stringify(data))})` });
+```
+
+### Kernel startup hook
+
+Before each kernel start, restarts included, the extension emits `ipython:kernel-starting` on `pi.events`. Listeners can change the payload:
+
+```ts
+interface KernelStartingEvent {
+	env: Record<string, string>; // added to the environment of the bridge and the kernel, not of Pi
+	startupCode: string[]; // runs hidden once the kernel is ready
+	waitFor(promise: Promise<unknown>): void; // the kernel starts after the promise settles
+}
+```
+
+- Change the payload before your first `await`. To fill a value later, pass a promise to `waitFor`.
+- If a startup snippet fails, the kernel start fails.
+- Names that startup code defines are not checkpointed.
+
+pi-rlm uses this hook to set up `rlm` in the kernel.
+
+### pi-durable hosts
+
+Hosts that run agents on [pi-durable](https://www.npmjs.com/package/@earendil-works/pi-durable), such as [workflows](https://github.com/Vzlentin/workflows), get the same tool from `durable/index.ts`. The package declares it in a field that Pi does not read:
 
 ```json
 "piDurable": { "extensions": ["./durable/index.ts"] }
 ```
 
-The default export takes the host's pi-durable and pi-ai modules and its event bus. It imports neither module at
-run time, so the host's copies are the only ones.
+The host passes in its own pi-durable and pi-ai modules and its event bus, so the package loads no second copy of either:
 
 ```ts
 import * as ai from "@earendil-works/pi-ai";
@@ -182,34 +208,29 @@ import ipython from "pi-ipython/durable/index.ts";
 
 const tool = ipython({ durable, ai, events });
 for (const extension of tool.extensions) registry.install(extension);
-// When the host stops: waits for pending checkpoints, then stops every kernel.
+
+// When the host stops: wait for pending checkpoints, then stop every kernel.
 await tool.close();
 ```
 
-- Each conversation gets its own kernel, in the conversation's working directory.
-- A cell's checkpoint ID is a `pi-ipython.checkpoint` entry of its conversation. A fork, or a store reopened after
-  a crash, restores the latest checkpoint of its own history, with the same notices as in Pi.
-- The output of a result is the output tail. Kernel resets, checkpoint restores and the line that names the file
-  with the full output are diagnostics, which the harness shows after it.
-- A result gives the cell's figures as PNG image content after the output text, as in Pi, with the same text part
-  for dropped figures.
-- The kernel-starting event names the conversation, and each cell emits `ipython:cell-start` and `ipython:cell-end`.
-  See [Extending the kernel](#extending-the-kernel).
-- Results have structured output: the `CellResult`, as in Pi. A tool that runs a cell through `api.executeTool`
-  gets it as `structuredOutput`.
+Differences from Pi:
+
+- Each conversation gets its own kernel, in the working directory of the conversation.
+- Checkpoint IDs are `pi-ipython.checkpoint` entries of the conversation. A fork, or a store that opens again after a crash, restores the latest checkpoint of its own history.
+- Kernel resets, restore notes and the truncation line are diagnostics, which the host shows after the output.
+- A tool that runs a cell through `api.executeTool` gets the result object of [Codemode scripts](#codemode-scripts) as `structuredOutput`.
+- `ipython:kernel-starting` also has `conversationId`. Each cell also emits `ipython:cell-start` with `{ conversationId, api, context }` before it runs, and `ipython:cell-end` with `{ conversationId }` after it ends, also when it fails. While the cell runs, a listener can use `api.commit(..., context)`, for example to create a conversation owned by `api.taskId`.
 - There is no `/cells` console.
 
-## Security
-
-The kernel is not sandboxed. Code runs with your user permissions and can access local files, environment variables, and the network. The separate Python runtime isolates dependencies, not system access.
-
-## Tests
+## Development
 
 ```bash
-npm test
+npm install
+npm test                             # lint, typecheck, then real kernels with no model
+pi -ne -e ./extensions/ipython.ts    # a Pi session with only this extension
 ```
 
-Model-free: typechecking and real kernels for state, working directory, synchronous and asynchronous interruption, overflow capture, reset cleanup, the startup hook, the Herdr console, and the pi-durable tool with a faux model. See [tests/README.md](tests/README.md).
+[tests/README.md](tests/README.md) lists what each test covers. [AGENTS.md](AGENTS.md) has the rules for changes.
 
 ## License
 
