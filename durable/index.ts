@@ -10,7 +10,7 @@
 import type * as Ai from "@earendil-works/pi-ai";
 import type * as Durable from "@earendil-works/pi-durable";
 import type { ConversationId, Cursor, Tx } from "@earendil-works/pi-durable";
-import { cellResult, DESCRIPTION } from "../core/cell.ts";
+import { CELL_PARAMETERS, CELL_RESULT_SCHEMA, cellResult, DESCRIPTION } from "../core/cell.ts";
 import { describeError, KERNEL_STARTING_EVENT, type KernelStartingEvent } from "../core/kernel-runtime.ts";
 import { OUTPUT_MAX_BYTES, OUTPUT_MAX_LINES } from "../core/output.ts";
 import { createRuntime, type Runtime } from "../core/persistence.ts";
@@ -35,7 +35,7 @@ export interface DurableHost {
 
 export const CHECKPOINT_ENTRY_KIND = "pi-ipython.checkpoint";
 
-export default function ipython({ durable, ai, events }: DurableHost) {
+export default function ipython({ durable, events }: DurableHost) {
 	const CheckpointEntry = durable.defineEntry<{ checkpoint: string }>(CHECKPOINT_ENTRY_KIND);
 	// One kernel per conversation until close(). Hosts with many conversations will need idle eviction.
 	const runtimes = new Map<string, Runtime>();
@@ -62,25 +62,12 @@ export default function ipython({ durable, ai, events }: DurableHost) {
 	const tool = durable.defineTool({
 		name: "ipython",
 		description: DESCRIPTION,
-		parameters: ai.Type.Object({ code: ai.Type.String({ description: "Python or an IPython cell" }) }),
+		parameters: CELL_PARAMETERS,
 		executionMode: "sequential",
-		// Keep equal to `outputSchema` in extensions/ipython.ts; this module cannot import it.
-		structuredOutputSchema: ai.Type.Object({
-			status: ai.Type.Union([ai.Type.Literal("ok"), ai.Type.Literal("error")], {
-				description: '"error" when the cell raised or was interrupted',
-			}),
-			output: ai.Type.String({ description: "Streams, display output and tracebacks, without ANSI codes" }),
-			executionCount: ai.Type.Optional(ai.Type.Integer()),
-			error: ai.Type.Optional(ai.Type.Object({ ename: ai.Type.String(), evalue: ai.Type.String() })),
-			truncated: ai.Type.Boolean({ description: "Only the tail of the output is kept" }),
-			fullOutputPath: ai.Type.Optional(ai.Type.String()),
-			notices: ai.Type.Array(ai.Type.String(), {
-				description: "Kernel restarts and checkpoint restores that happened before the cell ran",
-			}),
-		}),
+		structuredOutputSchema: CELL_RESULT_SCHEMA,
 		// The returned output is the cell's output tail, already within these limits, so the harness never cuts it again.
 		outputLimits: { maxLines: OUTPUT_MAX_LINES, maxBytes: OUTPUT_MAX_BYTES, retain: "tail" },
-		async execute(args, api, context) {
+		async execute(args: { code: string }, api, context) {
 			const signal = context.abortSignal;
 			const { cwd = process.cwd() } = await api.agent(context);
 

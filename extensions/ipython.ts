@@ -1,7 +1,14 @@
 import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
-import { type Static, Type } from "typebox";
+import { Type } from "typebox";
 import { Value } from "typebox/value";
-import { cellResult, DESCRIPTION, RESET_NOTICE } from "../core/cell.ts";
+import {
+	CELL_PARAMETERS,
+	CELL_RESULT_SCHEMA,
+	type CellResult,
+	cellResult,
+	DESCRIPTION,
+	RESET_NOTICE,
+} from "../core/cell.ts";
 import { describeError, KernelLostError, type KernelRuntime } from "../core/kernel-runtime.ts";
 import { partialText } from "../core/output.ts";
 import { createRuntime, type Runtime } from "../core/persistence.ts";
@@ -40,26 +47,12 @@ function checkpointIds(branch: SessionEntry[]): string[] {
 	return ids;
 }
 
-const parameters = Type.Object({
-	code: Type.String({ description: "Python or an IPython cell" }),
-});
+const parameters = Type.Unsafe<{ code: string }>(CELL_PARAMETERS);
 
-const outputSchema = Type.Object({
-	status: Type.Union([Type.Literal("ok"), Type.Literal("error")], {
-		description: '"error" when the cell raised or was interrupted',
-	}),
-	output: Type.String({ description: "Streams, display output and tracebacks, without ANSI codes" }),
-	executionCount: Type.Optional(Type.Integer()),
-	error: Type.Optional(Type.Object({ ename: Type.String(), evalue: Type.String() })),
-	truncated: Type.Boolean({ description: "Only the tail of the output is kept" }),
-	fullOutputPath: Type.Optional(Type.String()),
-	notices: Type.Array(Type.String(), {
-		description: "Kernel restarts and checkpoint restores that happened before the cell ran",
-	}),
-});
+const outputSchema = Type.Unsafe<CellResult>(CELL_RESULT_SCHEMA);
 
 /** The part of an ipython result's structured content that the calling tool's result receives. */
-const ForwardedNotices = Type.Pick(outputSchema, ["notices"]);
+const ForwardedNotices = Type.Object({ notices: Type.Array(Type.String()) });
 
 interface IpythonDetails {
 	status: "ok" | "error" | "running" | "starting";
@@ -224,12 +217,10 @@ export default function ipythonExtension(pi: ExtensionAPI) {
 				checkpoint: checkpoints.save(),
 			};
 
-			const structuredContent: Static<typeof outputSchema> = data;
-
 			return {
 				content: [{ type: "text", text }, ...figures],
 				details,
-				structuredContent,
+				structuredContent: data,
 				isError: data.status === "error",
 			};
 		},

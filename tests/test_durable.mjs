@@ -40,13 +40,51 @@ let nested;
 const caller = durable.defineTool({
 	name: "caller",
 	description: "Runs code through the ipython tool",
-	parameters: ai.Type.Object({ code: ai.Type.String() }),
+	parameters: { type: "object", required: ["code"], properties: { code: { type: "string" } } },
 	async execute(args, api, context) {
 		nested = await api.executeTool("ipython", { code: args.code }, context);
 
 		return { output: [{ type: "text", text: "called" }] };
 	},
 });
+
+/** The host's pi-ai without `Type`, as pi-ai 1.5.0 exports it. The entry must not need it. */
+const { Type: _type, ...hostAi } = ai;
+
+/** The JSON Schemas that models and nested callers see, equal to the TypeBox JSON of earlier releases. */
+const PARAMETERS = {
+	type: "object",
+	required: ["code"],
+	properties: { code: { type: "string", description: "Python or an IPython cell" } },
+};
+
+const STRUCTURED_OUTPUT = {
+	type: "object",
+	required: ["status", "output", "truncated", "notices"],
+	properties: {
+		status: {
+			anyOf: [
+				{ type: "string", const: "ok" },
+				{ type: "string", const: "error" },
+			],
+			description: '"error" when the cell raised or was interrupted',
+		},
+		output: { type: "string", description: "Streams, display output and tracebacks, without ANSI codes" },
+		executionCount: { type: "integer" },
+		error: {
+			type: "object",
+			required: ["ename", "evalue"],
+			properties: { ename: { type: "string" }, evalue: { type: "string" } },
+		},
+		truncated: { type: "boolean", description: "Only the tail of the output is kept" },
+		fullOutputPath: { type: "string" },
+		notices: {
+			type: "array",
+			items: { type: "string" },
+			description: "Kernel restarts and checkpoint restores that happened before the cell ran",
+		},
+	},
+};
 
 /** A host process: a Harness over the store, with the ipython extension installed from its pi-durable entry. */
 async function openHost() {
@@ -68,7 +106,10 @@ async function openHost() {
 				(error) => console.error("commit from cell-start failed:", error),
 			);
 	});
-	const tool = ipython({ durable, ai, events });
+	const tool = ipython({ durable, ai: hostAi, events });
+	const [ipythonTool] = tool.extensions[0].tools;
+	assert.deepEqual(ipythonTool.parameters, PARAMETERS);
+	assert.deepEqual(ipythonTool.structuredOutputSchema, STRUCTURED_OUTPUT);
 	const registry = durable.createRegistry();
 
 	for (const extension of tool.extensions) registry.install(extension);

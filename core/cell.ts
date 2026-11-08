@@ -54,6 +54,42 @@ export type CellResult = {
 	fullOutputPath?: string;
 };
 
+/** The JSON Schema of the `ipython` arguments in both hosts. */
+export const CELL_PARAMETERS = {
+	type: "object",
+	required: ["code"],
+	properties: { code: { type: "string", description: "Python or an IPython cell" } },
+};
+
+/** The JSON Schema of `CellResult` in both hosts. */
+export const CELL_RESULT_SCHEMA = {
+	type: "object",
+	required: ["status", "output", "truncated", "notices"],
+	properties: {
+		status: {
+			anyOf: [
+				{ type: "string", const: "ok" },
+				{ type: "string", const: "error" },
+			],
+			description: '"error" when the cell raised or was interrupted',
+		},
+		output: { type: "string", description: "Streams, display output and tracebacks, without ANSI codes" },
+		executionCount: { type: "integer" },
+		error: {
+			type: "object",
+			required: ["ename", "evalue"],
+			properties: { ename: { type: "string" }, evalue: { type: "string" } },
+		},
+		truncated: { type: "boolean", description: "Only the tail of the output is kept" },
+		fullOutputPath: { type: "string" },
+		notices: {
+			type: "array",
+			items: { type: "string" },
+			description: "Kernel restarts and checkpoint restores that happened before the cell ran",
+		},
+	},
+};
+
 /** A part of the tool result after the output text. It has the shape that Pi and pi-durable both accept. */
 export type FigurePart = { type: "image"; data: string; mimeType: "image/png" } | { type: "text"; text: string };
 
