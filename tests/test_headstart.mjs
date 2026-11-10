@@ -28,11 +28,20 @@ try {
 		"import json\nimport pandas as pd\nimport openpyxl\nfrom headstart import charge, sauve, montre, combien, compare",
 	);
 
-	// hs: dir(hs) lists exactly the verbs of the card in the tool description, and each one is callable.
-	const card = [...DESCRIPTION.matchAll(/^hs\.(\w+)\(/gm)].map((match) => match[1]).sort();
-	assert.equal(card.length, 9);
+	// hs.aide: it prints exactly the verbs of dir(hs), each one callable, and the notes on records and parquet.
+	const aide = await run("hs.aide()");
+	const table = [...aide.matchAll(/^hs\.(\w+)\(/gm)].map((match) => match[1]).sort();
+	assert.equal(table.length, 9);
+	assert.match(aide, /records/);
+	assert.match(aide, /\.parquet/);
 	const verbs = await run("print(json.dumps([sorted(dir(hs)), all(callable(getattr(hs, name)) for name in dir(hs))]))");
-	assert.deepEqual(JSON.parse(verbs), [card, true]);
+	assert.deepEqual(JSON.parse(verbs), [table, true]);
+
+	// hs in the tool description: each hs function that it names exists in the kernel.
+	const named = [...new Set([...DESCRIPTION.matchAll(/\bhs\.(\w+)/g)].map((match) => match[1]))];
+	assert.notEqual(named.length, 0);
+	const exists = await run(`print(all(callable(getattr(hs, name, None)) for name in ${JSON.stringify(named)}))`);
+	assert.equal(exists, "True");
 
 	// charge: a jsonl file skips lines that do not parse or are not objects, and reports the count.
 	await run(`open(${at("rows.jsonl")}, "w").write('{"a": 1}\\nnot json\\nnull\\n\\n{"a": 2}\\n')`);
@@ -378,4 +387,4 @@ try {
 	rmSync(root, { recursive: true, force: true });
 }
 
-console.log("headstart: charge, sauve, montre, combien, compare, joins, decris, verifie and interroge passed");
+console.log("headstart: aide, charge, sauve, montre, combien, compare, joins, decris, verifie and interroge passed");

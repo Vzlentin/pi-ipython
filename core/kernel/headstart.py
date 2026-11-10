@@ -11,6 +11,9 @@ column. Every frame verb also takes records, a list of dicts.
 Checks and queries: `verifie` runs named checks and raises once with every
 failed name. `interroge` runs a BigQuery query after a dry run, within a byte
 cap.
+
+Help: `aide` prints the verbs with their signatures, and the notes on inputs
+and file formats.
 """
 import json
 import os
@@ -38,6 +41,27 @@ _shown = None
 
 def __dir__():
     return __all__
+
+
+# The verbs of headstart and the notes on their inputs and formats, as hs.aide() prints them.
+AIDE = """\
+hs.charge(path, sheet=None) -> DataFrame         load jsonl, csv, json, xlsx, xlsm, xls, xlsb, ods; codes keep their zeros; skips bad jsonl lines
+hs.sauve(path, data) -> Path                     save json, jsonl, csv, xlsx, no index; only data that the kernel computed, never text
+hs.montre(x, n=40) -> x                          show a bounded view of any value; as the last line of a cell, it prints once
+hs.combien(df, key, *keys, n=20) -> DataFrame    count the most common values of the keys, with n and share; keeps missing values
+hs.compare(a, b, key) -> DataFrame               compare: one row for each key that differs, only a, only b, or changed
+hs.interroge(sql, cap=None) -> DataFrame | None  BigQuery; dry run first; no cap: print the type and the estimate only; cap like "20 GB"
+hs.joins(a, b, key, how="left") -> DataFrame     merge; prints matched, only a, only b; left and inner raise when rows multiply, unless validate=
+hs.decris(df) -> DataFrame                       one row per column: type, missing, distinct, top values, min, max
+hs.verifie({"name": cond}) -> None               runs all checks, prints each, raises with every failed name
+Each verb also takes records, a list[dict]. toml and other json load as plain values.
+For xlsx, a dict of DataFrames saves one sheet per key. pandas, numpy and every Excel engine are installed.
+charge and sauve also take .parquet."""
+
+
+def aide():
+    """Print the verbs of headstart, with one signature and one line each, and the notes on inputs and formats."""
+    print(AIDE)
 
 
 def install(shell):

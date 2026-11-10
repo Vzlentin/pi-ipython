@@ -61,7 +61,7 @@ The kernel stops within 5 seconds after Pi exits, also when Pi is killed. On a n
 
 ## `hs`, the data toolkit
 
-Every kernel starts with `headstart` imported as `hs`. The tool description gives the agent the same list, and tells it to use Pi's `write`, `edit` and `bash` tools for files and commands, not Python.
+Every kernel starts with `headstart` imported as `hs`. The tool description names `hs` in one line, and `hs.aide()` prints the functions below with their signatures. The description also tells the agent to use Pi's `write`, `edit` and `bash` tools for files and commands, not Python.
 
 | Function | What it does |
 | --- | --- |
