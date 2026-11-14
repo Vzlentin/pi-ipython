@@ -54,6 +54,27 @@ function checkpointIds(branch: SessionEntry[]): string[] {
 	return ids;
 }
 
+/**
+ * The `PI_*` variables that Pi's bash tool gives each command, from the current session. `null` removes an
+ * inherited value, as bash does.
+ */
+function sessionEnvironment(ctx: ExtensionContext) {
+	return {
+		PI_SESSION_ID: ctx.sessionManager.getSessionId(),
+		PI_SESSION_FILE: ctx.sessionManager.getSessionFile() || null,
+		PI_PROVIDER: ctx.model?.provider ?? null,
+		PI_MODEL: ctx.model?.id ?? null,
+		PI_REASONING_LEVEL: ctx.thinkingLevel || null,
+	};
+}
+
+/** Kernel startup code that sets the session's `PI_*` variables in `os.environ`, and leaves no names behind. */
+function sessionEnvironmentCode(ctx: ExtensionContext): string {
+	const values = JSON.stringify(JSON.stringify(sessionEnvironment(ctx)));
+
+	return `(lambda env, values: [env.pop(k, None) if v is None else env.__setitem__(k, v) for k, v in values.items()])(__import__('os').environ, __import__('json').loads(${values}))`;
+}
+
 const parameters = Type.Unsafe<{ code: string }>(CELL_PARAMETERS);
 
 const outputSchema = Type.Unsafe<CellResult>(CELL_RESULT_SCHEMA);
@@ -80,7 +101,19 @@ export default function ipythonExtension(pi: ExtensionAPI) {
 
 	const getRuntime = (ctx: ExtensionContext) => {
 		if (runtime) return runtime;
-		const created = createRuntime(pi, ctx.cwd);
+
+		const created = createRuntime(
+			{
+				events: {
+					emit: (name, starting) => {
+						// `process.env` can hold the `PI_*` values of an older session. Bash takes them from the ctx, and so does the kernel.
+						starting.startupCode.push(sessionEnvironmentCode(ctx));
+						pi.events.emit(name, starting);
+					},
+				},
+			},
+			ctx.cwd,
+		);
 
 		const sigterm = () => {
 			// Another handler can remove itself while shutdown is in progress.
