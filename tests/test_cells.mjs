@@ -273,6 +273,7 @@ process.env.PI_IPYTHON_PERSISTENCE = "0";
 
 ipythonExtension({
 	...pi,
+	events: { emit() {} },
 	registerTool(value) {
 		tool = value;
 	},

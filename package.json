@@ -18,7 +18,8 @@
 		"test:persistence": "node --no-warnings tests/test_persistence.mjs && node --no-warnings tests/test_branches.mjs && node --no-warnings tests/test_checkpoint_limits.mjs",
 		"test:output": "node --no-warnings tests/test_output.mjs",
 		"test:durable": "node --no-warnings tests/test_durable.mjs",
-		"test": "npm run lint && npm run typecheck && npm run test:output && npm run test:kernel && npm run test:persistence && npm run test:durable"
+		"test:pi": "node --no-warnings tests/test_pi_events.mjs",
+		"test": "npm run lint && npm run typecheck && npm run test:output && npm run test:kernel && npm run test:persistence && npm run test:durable && npm run test:pi"
 	},
 	"pi": {
 		"extensions": [

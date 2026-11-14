@@ -191,6 +191,15 @@ interface KernelStartingEvent {
 
 pi-rlm uses this hook to set up `rlm` in the kernel.
 
+### Cell events
+
+Each cell emits two events on `pi.events`:
+
+- `ipython:cell-start` with `{ toolCallId, ctx }` before the cell runs. `ctx` is the context that Pi gives to the tool call, with `ctx.executeTool`.
+- `ipython:cell-end` with `{ toolCallId }` after the cell ends, also when it fails, is aborted or loses its kernel.
+
+While the cell runs, a listener can use `ctx.executeTool` to run other tools, for example a tool that the kernel calls back. A listener must not run `ipython` through `ctx`: the kernel is busy with the cell, and the call waits for it. A cell that a codemode script runs emits its own pair of events, with the ID of the nested call.
+
 ### pi-durable hosts
 
 Hosts that run agents on [pi-durable](https://www.npmjs.com/package/@earendil-works/pi-durable), such as [workflows](https://github.com/Vzlentin/workflows), get the same tool from `durable/index.ts`. The package declares it in a field that Pi does not read:

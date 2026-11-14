@@ -1,4 +1,11 @@
-import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
+import type {
+	AgentToolResult,
+	AgentToolUpdateCallback,
+	ExtensionAPI,
+	ExtensionContext,
+	ExtensionToolContext,
+	SessionEntry,
+} from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { Value } from "typebox/value";
 import {
@@ -123,6 +130,106 @@ export default function ipythonExtension(pi: ExtensionAPI) {
 		handler: toggleCells,
 	});
 
+	const runCell = async (
+		toolCallId: string,
+		params: { code: string },
+		signal: AbortSignal | undefined,
+		onUpdate: AgentToolUpdateCallback<IpythonDetails> | undefined,
+		ctx: ExtensionToolContext,
+	): Promise<AgentToolResult<IpythonDetails>> => {
+		const { kernel, checkpoints } = getRuntime(ctx);
+		const transcript = ctx.mode === "tui" && process.env.HERDR_ENV === "1" ? cells : undefined;
+		transcript?.begin(params.code);
+		let latestOutput = "";
+		let lastUpdate = 0;
+		let updateTimer: ReturnType<typeof setTimeout> | undefined;
+
+		const progress = (message: string) => {
+			transcript?.note(message);
+
+			if (updateTimer) {
+				clearTimeout(updateTimer);
+				updateTimer = undefined;
+			}
+
+			lastUpdate = Date.now();
+			const status = message.startsWith("Starting") || message.startsWith("Provisioning") ? "starting" : "running";
+			const text = latestOutput ? `${message}\n\n${partialText(latestOutput)}` : message;
+			onUpdate?.({
+				content: [{ type: "text", text }],
+				details: { status } satisfies IpythonDetails,
+			});
+		};
+
+		const emitOutput = () => {
+			updateTimer = undefined;
+			lastUpdate = Date.now();
+			onUpdate?.({
+				content: [{ type: "text", text: partialText(latestOutput) }],
+				details: { status: "running" } satisfies IpythonDetails,
+			});
+		};
+
+		const output = (text: string) => {
+			transcript?.output(text);
+			latestOutput = text;
+			const delay = Math.max(0, 100 - (Date.now() - lastUpdate));
+
+			if (delay === 0) emitOutput();
+			else if (!updateTimer) updateTimer = setTimeout(emitOutput, delay);
+		};
+
+		let execution: Awaited<ReturnType<KernelRuntime["execute"]>>;
+		let notices: string[];
+
+		try {
+			notices = await checkpoints.sync(checkpointIds(ctx.sessionManager.getBranch()), ctx.cwd, signal, progress);
+			execution = await kernel.execute(toolCallId, params.code, ctx.cwd, signal, progress, output);
+		} catch (error) {
+			if (error instanceof KernelLostError) forwarded.set(toolCallId, [RESET_NOTICE]);
+			transcript?.finish(`error: ${String(error)}`);
+			throw error;
+		} finally {
+			if (updateTimer) clearTimeout(updateTimer);
+		}
+
+		const { result, kernelReset } = execution;
+		const received = [...undelivered, ...notices];
+		const { data, header, figures } = cellResult(execution, received, (text) => kernel.saveOutput(text));
+		const notice = data.notices.join("\n\n");
+		undelivered = [];
+		transcript?.output(result.output);
+
+		if (notice) transcript?.note(notice);
+
+		if (result.status !== "ok" && !result.output) transcript?.note(describeError(result.error));
+		transcript?.finish(
+			`${result.status}${result.executionCount === undefined ? "" : ` | In [${result.executionCount}]`}`,
+		);
+		const body = header ? `${header}\n${data.output}` : data.output;
+
+		const text =
+			(notice && body ? `${notice}\n\n${body}` : notice || body) ||
+			(data.status === "error" && describeError(result.error)) ||
+			"[no output]";
+
+		const details: IpythonDetails = {
+			status: data.status,
+			executionCount: data.executionCount,
+			kernelReset,
+			truncated: data.truncated,
+			fullOutputPath: data.fullOutputPath,
+			checkpoint: checkpoints.save(),
+		};
+
+		return {
+			content: [{ type: "text", text }, ...figures],
+			details,
+			structuredContent: data,
+			isError: data.status === "error",
+		};
+	};
+
 	pi.registerTool({
 		name: "ipython",
 		label: "IPython",
@@ -132,97 +239,13 @@ export default function ipythonExtension(pi: ExtensionAPI) {
 		outputSchema,
 		executionMode: "sequential",
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
-			const { kernel, checkpoints } = getRuntime(ctx);
-			const transcript = ctx.mode === "tui" && process.env.HERDR_ENV === "1" ? cells : undefined;
-			transcript?.begin(params.code);
-			let latestOutput = "";
-			let lastUpdate = 0;
-			let updateTimer: ReturnType<typeof setTimeout> | undefined;
-
-			const progress = (message: string) => {
-				transcript?.note(message);
-
-				if (updateTimer) {
-					clearTimeout(updateTimer);
-					updateTimer = undefined;
-				}
-
-				lastUpdate = Date.now();
-				const status = message.startsWith("Starting") || message.startsWith("Provisioning") ? "starting" : "running";
-				const text = latestOutput ? `${message}\n\n${partialText(latestOutput)}` : message;
-				onUpdate?.({
-					content: [{ type: "text", text }],
-					details: { status } satisfies IpythonDetails,
-				});
-			};
-
-			const emitOutput = () => {
-				updateTimer = undefined;
-				lastUpdate = Date.now();
-				onUpdate?.({
-					content: [{ type: "text", text: partialText(latestOutput) }],
-					details: { status: "running" } satisfies IpythonDetails,
-				});
-			};
-
-			const output = (text: string) => {
-				transcript?.output(text);
-				latestOutput = text;
-				const delay = Math.max(0, 100 - (Date.now() - lastUpdate));
-
-				if (delay === 0) emitOutput();
-				else if (!updateTimer) updateTimer = setTimeout(emitOutput, delay);
-			};
-
-			let execution: Awaited<ReturnType<KernelRuntime["execute"]>>;
-			let notices: string[];
+			pi.events.emit("ipython:cell-start", { toolCallId, ctx });
 
 			try {
-				notices = await checkpoints.sync(checkpointIds(ctx.sessionManager.getBranch()), ctx.cwd, signal, progress);
-				execution = await kernel.execute(toolCallId, params.code, ctx.cwd, signal, progress, output);
-			} catch (error) {
-				if (error instanceof KernelLostError) forwarded.set(toolCallId, [RESET_NOTICE]);
-				transcript?.finish(`error: ${String(error)}`);
-				throw error;
+				return await runCell(toolCallId, params, signal, onUpdate, ctx);
 			} finally {
-				if (updateTimer) clearTimeout(updateTimer);
+				pi.events.emit("ipython:cell-end", { toolCallId });
 			}
-
-			const { result, kernelReset } = execution;
-			const received = [...undelivered, ...notices];
-			const { data, header, figures } = cellResult(execution, received, (text) => kernel.saveOutput(text));
-			const notice = data.notices.join("\n\n");
-			undelivered = [];
-			transcript?.output(result.output);
-
-			if (notice) transcript?.note(notice);
-
-			if (result.status !== "ok" && !result.output) transcript?.note(describeError(result.error));
-			transcript?.finish(
-				`${result.status}${result.executionCount === undefined ? "" : ` | In [${result.executionCount}]`}`,
-			);
-			const body = header ? `${header}\n${data.output}` : data.output;
-
-			const text =
-				(notice && body ? `${notice}\n\n${body}` : notice || body) ||
-				(data.status === "error" && describeError(result.error)) ||
-				"[no output]";
-
-			const details: IpythonDetails = {
-				status: data.status,
-				executionCount: data.executionCount,
-				kernelReset,
-				truncated: data.truncated,
-				fullOutputPath: data.fullOutputPath,
-				checkpoint: checkpoints.save(),
-			};
-
-			return {
-				content: [{ type: "text", text }, ...figures],
-				details,
-				structuredContent: data,
-				isError: data.status === "error",
-			};
 		},
 	});
 
